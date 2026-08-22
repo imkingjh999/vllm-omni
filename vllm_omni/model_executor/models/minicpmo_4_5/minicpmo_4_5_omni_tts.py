@@ -15,6 +15,8 @@ from collections.abc import Iterable
 from typing import Any
 
 import torch
+import os
+
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LlamaConfig
@@ -134,6 +136,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self._batch_stop_logits: torch.Tensor | None = None
         self._request_generators: dict[str, torch.Generator] = {}
+        # Codec sampling on CPU (NPU kernel-launch bound at batch 1);
+        # default on for NPU deployments, disable with MINICPMO_SAMP_CPU=0.
+        self._samp_cpu = os.environ.get("MINICPMO_SAMP_CPU", "1") != "0"
+        self._request_generators_cpu: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
 
@@ -370,6 +376,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             self._request_generators[request_id] = generator
         return generator
 
+    def _request_generator_cpu(self, request_id: str) -> torch.Generator:
+        generator = self._request_generators_cpu.get(request_id)
+        if generator is None:
+            generator = torch.Generator(device="cpu")
+            generator.manual_seed(self._codec_seed)
+            self._request_generators_cpu[request_id] = generator
+        return generator
+
     def _sample_audio_code(
         self,
         hidden_state: torch.Tensor,
@@ -377,7 +391,45 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_id: str,
         step: int,
     ) -> torch.Tensor:
-        logits = self.head_code[0](hidden_state).float() / self._codec_temperature
+        logits = self.head_code[0](hidden_state).float()
+        if self._samp_cpu and logits.device.type == "npu":
+            # Single-row codec sampling on NPU is kernel-launch bound
+            # (penalty/masks/top-k/softmax/multinomial ≈ a dozen tiny
+            # launches per frame). Run the sampling chain on CPU instead:
+            # one small D2H of the logits row, one H2D of the sampled id.
+            return self._sample_audio_code_cpu(logits, history, request_id, step)
+        logits = logits / self._codec_temperature
+        return self._sample_audio_code_common(logits, history, request_id, step, device=logits.device)
+
+    def _sample_audio_code_cpu(
+        self,
+        logits: torch.Tensor,
+        history: torch.Tensor,
+        request_id: str,
+        step: int,
+    ) -> torch.Tensor:
+        device = logits.device
+        logits = logits.to("cpu") / self._codec_temperature
+        if history.device.type != "cpu":
+            history = history.to("cpu")
+        sampled = self._sample_audio_code_common(
+            logits,
+            history,
+            request_id,
+            step,
+            device="cpu",
+        )
+        return sampled.to(device)
+
+    def _sample_audio_code_common(
+        self,
+        logits: torch.Tensor,
+        history: torch.Tensor,
+        request_id: str,
+        step: int,
+        *,
+        device,
+    ) -> torch.Tensor:
         eos_id = self._num_audio_tokens - 1
         logits = _apply_repetition_penalty(
             logits,
@@ -399,10 +451,15 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             min_tokens_to_keep=3,
         )
         probabilities = torch.softmax(logits, dim=-1)
+        generator = (
+            self._request_generator_cpu(request_id)
+            if device == "cpu"
+            else self._request_generator(request_id, probabilities.device)
+        )
         return torch.multinomial(
             probabilities,
             num_samples=1,
-            generator=self._request_generator(request_id, probabilities.device),
+            generator=generator,
         ).reshape(())
 
     def make_omni_output(
@@ -575,6 +632,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         request_audio_states = getattr(self, "_request_audio_states", {})
         for request_id in self._deferred_cleanup_ids:
             self._request_generators.pop(request_id, None)
+            self._request_generators_cpu.pop(request_id, None)
             request_audio_states.pop(request_id, None)
         self._deferred_cleanup_ids.clear()
 
