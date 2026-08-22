@@ -17,6 +17,8 @@ from dataclasses import replace
 from typing import Any
 
 import torch
+import os
+
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LlamaConfig
@@ -157,6 +159,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self._mask_eos_rows: list[bool] | None = None
         self._pending_force_eos_rows: list[bool] | None = None
         self._penalty_histories: list[torch.Tensor] | None = None
+        self._batch_stop_logits: torch.Tensor | None = None
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
 
