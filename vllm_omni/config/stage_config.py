@@ -301,6 +301,7 @@ class StageDeployConfig:
     default_sampling_params: dict[str, Any] | None = None
     default_pooling_params: dict[str, Any] | None = None
     subtalker_sampling_params: dict[str, Any] | None = None
+    silence_ban_frames: int = 0
 
     # === Generic stage engine fields ===
     # Parallelism, scheduler, and memory-capacity controls.
@@ -532,7 +533,13 @@ def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
 
 
 _DEEP_MERGE_KEYS = frozenset(
-    {"default_sampling_params", "default_pooling_params", "subtalker_sampling_params", "engine_extras", "engine_args"}
+    {
+        "default_sampling_params",
+        "default_pooling_params",
+        "subtalker_sampling_params",
+        "engine_extras",
+        "engine_args",
+    }
 )
 
 
@@ -632,6 +639,11 @@ def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
 def load_deploy_config(path: str | Path) -> DeployConfig:
     """Load a deploy YAML (with optional base_config inheritance)."""
     raw_dict = resolve_deploy_yaml(path)
+    if "stage_args" in raw_dict:
+        raise ValueError(
+            f"Deploy config {path} uses the removed `stage_args` schema; "
+            "define topology in PipelineConfig and deployment overrides under `stages`."
+        )
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 

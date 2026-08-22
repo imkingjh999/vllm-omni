@@ -24,6 +24,7 @@ from vllm_omni.diffusion.data import SHUTDOWN_MESSAGE, AsyncDiffusionOutput, Asy
 from vllm_omni.diffusion.executor.abstract import DiffusionExecutor
 from vllm_omni.diffusion.ipc import DIFFUSION_RPC_RESULT_ENVELOPE, unpack_diffusion_output_shm
 from vllm_omni.diffusion.sched.request_scheduler import build_request_batch_sampling_params_key
+from vllm_omni.diffusion.utils.future_utils import try_set_exception, try_set_result
 from vllm_omni.diffusion.worker import WorkerProc
 
 if TYPE_CHECKING:
@@ -464,16 +465,14 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
         for new_req in new_reqs:
             validate_new_request_data_identity(new_req)
 
-        has_diffusion_kv_metadata = any(new_req.diffusion_kv_metadata is not None for new_req in new_reqs)
-
         # DP multi-concurrency: when DLO+AllGather is active and multiple
-        # requests are scheduled, send ALL requests in one broadcast RPC.
-        # Each rank picks req[rank % len(reqs)] and computes independently.
+        # requests are scheduled, send every complete NewRequestData envelope
+        # in one broadcast RPC. Each rank picks one envelope, keeping its
+        # request and Diffusion KV metadata inseparable.
         # All ranks reply (unique_reply_rank=None) so we collect dp_size
         # responses and match by dp_rank.
         if (
             len(new_reqs) > 1
-            and not has_diffusion_kv_metadata
             and getattr(self.od_config, "enable_distributed_layerwise_offload", False)
             and getattr(self.od_config, "dlo_use_allgather", True)
         ):
@@ -506,12 +505,11 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     f"empty prompt request IDs: {empty_prompt_ids}."
                 )
 
-            reqs_list = [nr.req for nr in new_reqs]
             try:
                 results = self.collective_rpc(
                     "execute_model",
                     timeout=_DLO_DP_WAVE_TIMEOUT_S,
-                    args=(reqs_list, self.od_config, scheduler_output.kv_prefetch_job),
+                    args=(new_reqs, self.od_config, scheduler_output.kv_prefetch_job),
                     unique_reply_rank=None,
                     exec_all_ranks=True,
                 )
@@ -870,9 +868,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                     fut = self._rpc_futures.pop(msg.rpc_id, None) if msg.rpc_id else None
                 if fut is not None and not fut.done():
                     if msg.error:
-                        fut.set_exception(RuntimeError(msg.error))
+                        try_set_exception(fut, RuntimeError(msg.error))
                     else:
-                        fut.set_result(msg)
+                        try_set_result(fut, msg)
             elif msg.kind == AsyncOutputKind.OUTPUT_READY:
                 batch_id = msg.async_output_id
                 with self._futures_lock:
@@ -903,9 +901,9 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
                             pending = self._output_futures.pop(batch_id, None)
                             if pending is not None and not pending.done():
                                 if exc is not None:
-                                    pending.set_exception(exc)
+                                    try_set_exception(pending, exc)
                                 else:
-                                    pending.set_result(output_result)
+                                    try_set_result(pending, output_result)
                             else:
                                 fut = concurrent.futures.Future()
                                 if exc is not None:
@@ -933,7 +931,7 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             with self._futures_lock:
                 pending = self._output_futures.pop(per_req_id, None)
                 if pending is not None and not pending.done():
-                    pending.set_result(per_req_result)
+                    try_set_result(pending, per_req_result)
                 else:
                     fut: concurrent.futures.Future = concurrent.futures.Future()
                     fut.set_result(per_req_result)
@@ -999,10 +997,10 @@ class MultiprocDiffusionExecutor(DiffusionExecutor):
             with self._futures_lock:
                 for fut in self._rpc_futures.values():
                     if not fut.done():
-                        fut.set_exception(RuntimeError("Executor shut down"))
+                        try_set_exception(fut, RuntimeError("Executor shut down"))
                 for fut in self._output_futures.values():
                     if not fut.done():
-                        fut.set_exception(RuntimeError("Executor shut down"))
+                        try_set_exception(fut, RuntimeError("Executor shut down"))
                 self._rpc_futures.clear()
                 self._output_futures.clear()
                 self._batch_split_map.clear()

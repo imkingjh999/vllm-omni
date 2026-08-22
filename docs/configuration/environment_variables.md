@@ -62,7 +62,7 @@ The lifecycle labels used below are:
 ### Diffusion backend and cache selection
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `DIFFUSION_ATTENTION_BACKEND` | Backend name or `auto`; default `auto` (platform selection) | Diffusion stages; read when `OmniDiffusionConfig` is constructed | `diffusion_attention_config.default` wins. An unknown backend fails during backend resolution. | Stable fallback |
 | `DIFFUSION_CACHE_BACKEND` | `none`, `cache_dit`, `tea_cache`, `mag_cache`, `step_cache`, `stepcache`, or `step_cache_dit`; default `none` | Diffusion runner startup | Explicit `cache_backend` in config wins. Otherwise this name wins over the deprecated alias. Unsupported values raise `ValueError` during runner setup. | Stable fallback |
 | `DIFFUSION_CACHE_ADAPTER` | Same values as `DIFFUSION_CACHE_BACKEND`; default `none` | Diffusion runner startup | Used only when neither explicit `cache_backend` nor `DIFFUSION_CACHE_BACKEND` is set. Unsupported values raise `ValueError`. | Deprecated; use `DIFFUSION_CACHE_BACKEND` |
@@ -79,7 +79,7 @@ depends on the installed kernels and model path.
 ### Serving and runtime
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `SPEAKER_SAMPLES_DIR` | Filesystem path; default `~/.cache/vllm-omni/speakers` | Speech server; read when speaker storage initializes | Environment-only setting. The directory is created; filesystem errors propagate. | Stable |
 | `SPEAKER_MAX_UPLOADED` | Integer; default `1000` | Speech server; read when speaker storage initializes | Environment-only setting. A non-integer logs a warning and uses `1000`; range is not otherwise validated. | Stable |
 | `VLLM_OMNI_INPUT_WAIT_TIMEOUT_S` | Float seconds; default `600`; `<=0` disables | Full-payload input coordinator, not async-chunk transfer; read when the scheduler module imports in each worker | Environment-only setting. A non-float logs a warning and uses `600`. | Stable operational control |
@@ -95,7 +95,7 @@ when `ServerSettings` is initialized, normally during server import/startup.
 Invalid integer values raise a Pydantic validation error.
 
 | Name | Type and default | Meaning | Lifecycle |
-|---|---|---|---|
+| --- | --- | --- | --- |
 | `VLLM_OMNI_SERVER_STORAGE__PATH` | Path; default `/tmp/storage` | Directory for completed server files. | Stable |
 | `VLLM_OMNI_SERVER_STORAGE__FILE_CONCURRENCY` | Integer; default `4` | Maximum concurrent file operations. No additional range validation is currently applied. | Stable |
 | `VLLM_OMNI_SERVER_STORAGE__FILE_TTL` | Integer seconds or unset; default unset | Optional lifetime for locally stored files. | Stable |
@@ -109,7 +109,7 @@ settings.
 ### Quantization diagnostics and performance
 
 | Name | Type and default | Applies to and read time | Precedence and invalid values | Lifecycle |
-|---|---|---|---|---|
+| --- | --- | --- | --- | --- |
 | `VLLM_OMNI_SKIP_NVFP4_NAN_CLAMP` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; default false | ModelOpt NVFP4 compatibility patch; read when `vllm_omni.patch` imports | Environment-only escape hatch. Any other value means false. Set only to diagnose the upstream NaN-scale issue. | Diagnostic and temporary |
 | `VLLM_OMNI_USE_QUACK_FP8` | Boolean truthy spellings: `1`, `true`, `yes`, `on`; unset means hardware auto-detection | FP8 scaled matrix multiplication; evaluated when quack capability is selected | A set value overrides auto-detection. Any non-truthy value forces quack off. If quack cannot load, vLLM-Omni warns and falls back to FlashInfer. | Experimental performance control |
 
@@ -177,7 +177,7 @@ collection, examples, bug reports, or logs.
 
 ## Model-specific variables
 
-The audit found 55 variables read by a single model or pipeline family. They are
+The audit found 57 variables read by a single model or pipeline family. They are
 not listed as public usage options here because doing so would turn implementation
 escape hatches into an accidental compatibility contract.
 
@@ -185,12 +185,12 @@ Every audited model-specific name has a migration disposition in the
 [environment-variable inventory](gh-file:vllm_omni/config/environment_variable_inventory.py):
 
 | Disposition | Count | Required outcome |
-|---|---:|---|
-| Promote | 32 | Move a stable setting into typed stage or model configuration. |
+| --- | ---: | --- |
+| Promote | 33 | Move a stable setting into typed stage or model configuration. |
 | Request scope | 6 | Move request-varying behavior into a declared request-option schema. |
 | External | 0 | Retain only when a supported third-party library owns the contract. |
 | Internalize | 11 | Keep a debug or diagnostic switch out of public documentation and configuration. |
-| Deprecate/remove | 6 | Remove a compatibility escape hatch that has no continuing contract. |
+| Deprecate/remove | 7 | Remove a compatibility escape hatch that has no continuing contract. |
 
 The disposition is a migration target, not a statement that the existing
 environment switch is stable. Promote or request-scope work should land in

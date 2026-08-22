@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Reviewed inventory of environment variables used by vLLM-Omni.
 
 This module classifies environment-variable names; it does not read them or
@@ -102,6 +102,7 @@ _INHERITED_VLLM = (
 )
 
 _PLATFORM_EXTERNAL = (
+    "ASCEND_LAUNCH_BLOCKING",
     "ASCEND_RT_VISIBLE_DEVICES",
     "FLASHINFER_DISABLE_VERSION_CHECK",
     "HF_HOME",
@@ -163,6 +164,7 @@ _MODEL_PROMOTE = (
     "VLLM_GEPARD_FIRST_CHUNK_FRAMES",
     "VLLM_GEPARD_LOOKBACK_FRAMES",
     "VLLM_OMNI_FISH_KVCACHE_ATTN",
+    "VLLM_OMNI_SANA_WM_STAGE1_TEXT_ENCODER",
 )
 
 _MODEL_REQUEST_SCOPE = (
@@ -196,6 +198,7 @@ _MODEL_INTERNALIZE = (
 _MODEL_DEPRECATE_REMOVE = (
     "HIGGS_AUDIO_V2_TOKENIZER_PATH",
     "ROSVOT_SOURCE_DIR",
+    "VLLM_OMNI_LINGBOT_ACTION_ROOT",
     "VLLM_OMNI_VOXCPM_CODE_PATH",
     "VLLM_USE_FLASHINFER_MOE_FP16",
     "XCODEC1_PATH",

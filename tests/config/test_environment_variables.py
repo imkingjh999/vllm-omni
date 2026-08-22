@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Drift checks for the reviewed environment-variable inventory."""
 
 import ast
@@ -121,7 +121,7 @@ def _environment_wrapper_parameters(
     wrappers: dict[str, set[tuple[str, int | None]]] = {}
     for function in (node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
         positional = [*function.args.posonlyargs, *function.args.args]
-        parameter_indexes = {parameter.arg: index for index, parameter in enumerate(positional)}
+        parameter_indexes: dict[str, int | None] = {parameter.arg: index for index, parameter in enumerate(positional)}
         parameter_indexes.update({parameter.arg: None for parameter in function.args.kwonlyargs})
         forwarded: set[tuple[str, int | None]] = set()
         for node in ast.walk(function):
@@ -148,13 +148,13 @@ def _environment_accesses(path: Path) -> set[str]:
 
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
             for parameter_name, position in wrappers.get(node.func.id, set()):
-                expression = node.args[position] if position is not None and position < len(node.args) else None
-                if expression is None:
-                    expression = next(
+                argument = node.args[position] if position is not None and position < len(node.args) else None
+                if argument is None:
+                    argument = next(
                         (keyword.value for keyword in node.keywords if keyword.arg == parameter_name),
                         None,
                     )
-                if expression is not None and (name := _resolve_environment_name(expression, constants)):
+                if argument is not None and (name := _resolve_environment_name(argument, constants)):
                     names.add(name)
 
     return names
@@ -166,8 +166,8 @@ def test_inventory_matches_reviewed_snapshot_counts():
     assert category_counts == {
         EnvironmentVariableCategory.PUBLIC_OMNI: 22,
         EnvironmentVariableCategory.INHERITED_VLLM: 20,
-        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 26,
-        EnvironmentVariableCategory.MODEL_SPECIFIC: 55,
+        EnvironmentVariableCategory.PLATFORM_EXTERNAL: 27,
+        EnvironmentVariableCategory.MODEL_SPECIFIC: 57,
         EnvironmentVariableCategory.BENCHMARK_TRANSITIONAL: 20,
         EnvironmentVariableCategory.INTERNAL: 2,
     }
@@ -178,11 +178,11 @@ def test_inventory_matches_reviewed_snapshot_counts():
         if item.category is EnvironmentVariableCategory.MODEL_SPECIFIC
     )
     assert {disposition: disposition_counts[disposition] for disposition in ModelEnvironmentVariableDisposition} == {
-        ModelEnvironmentVariableDisposition.PROMOTE: 32,
+        ModelEnvironmentVariableDisposition.PROMOTE: 33,
         ModelEnvironmentVariableDisposition.REQUEST_SCOPE: 6,
         ModelEnvironmentVariableDisposition.EXTERNAL: 0,
         ModelEnvironmentVariableDisposition.INTERNALIZE: 11,
-        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 6,
+        ModelEnvironmentVariableDisposition.DEPRECATE_REMOVE: 7,
     }
 
 
