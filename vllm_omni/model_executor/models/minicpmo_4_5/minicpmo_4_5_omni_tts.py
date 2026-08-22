@@ -136,9 +136,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         self.vllm_config = vllm_config
         self._batch_stop_logits: torch.Tensor | None = None
         self._request_generators: dict[str, torch.Generator] = {}
-        # Codec sampling on CPU (NPU kernel-launch bound at batch 1);
-        # default on for NPU deployments, disable with MINICPMO_SAMP_CPU=0.
-        self._samp_cpu = os.environ.get("MINICPMO_SAMP_CPU", "1") != "0"
+        # Codec sampling on CPU (NPU kernel-launch bound at batch 1); opt-in
+        # with MINICPMO_SAMP_CPU=1 — measured perf-neutral on 910B3, and the
+        # CPU RNG stream differs from NPU at the same seed (WER/SIM re-run
+        # required), so it ships off by default.
+        self._samp_cpu = os.environ.get("MINICPMO_SAMP_CPU", "0") == "1"
         self._request_generators_cpu: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
