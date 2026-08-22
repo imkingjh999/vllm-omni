@@ -210,6 +210,11 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
     assert warm is warm_model
     assert warm_model.load_count == 0
     assert torch.equal(warm_model.transformer.weight, cold_model.transformer.weight)
+    from vllm_omni.diffusion.offloader.startup import take_offload_startup_state
+
+    startup_state = take_offload_startup_state(warm)
+    assert startup_state is not None
+    assert startup_state.host_weight_plan is not None
     warm_plan = warm_loader.take_host_weight_plan()
     assert warm_plan is not None
     assert warm_plan.lease_carrier is not None

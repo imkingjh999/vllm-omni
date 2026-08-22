@@ -39,6 +39,7 @@ from vllm_omni.diffusion.offloader.offload_plan import (
     OffloadPlan,
     get_offload_plan,
 )
+from vllm_omni.diffusion.offloader.startup import OffloadStartupState, attach_offload_startup_state
 from vllm_omni.platforms import current_omni_platform
 
 pytestmark = [pytest.mark.diffusion, pytest.mark.cpu, pytest.mark.core_model]
@@ -1763,6 +1764,65 @@ class TestConfigValidation:
                 device=torch.device("cpu"),
                 host_weight_plan=plan,
             )
+
+    def test_startup_recovery_stays_inside_offloader_boundary(self, monkeypatch):
+        import vllm_omni.diffusion.offloader as offloader_module
+
+        class FakeCarrier:
+            def __init__(self):
+                self.closed = False
+
+            def close(self):
+                self.closed = True
+
+        class FakePlan:
+            def __init__(self, carrier):
+                self.lease_carrier = carrier
+
+        class FailingBackend:
+            def __init__(self):
+                self.disabled = False
+
+            def enable(self, pipeline):
+                del pipeline
+                raise RuntimeError("initial prefetch failed")
+
+            def disable(self):
+                self.disabled = True
+
+        warm_pipeline = nn.Module()
+        canonical_pipeline = nn.Module()
+        carrier = FakeCarrier()
+        plan = FakePlan(carrier)
+        failing_backend = FailingBackend()
+        calls = []
+
+        def fake_backend(od_config, device, host_weight_plan):
+            del od_config, device
+            calls.append(host_weight_plan)
+            return failing_backend if host_weight_plan is plan else None
+
+        attach_offload_startup_state(
+            warm_pipeline,
+            OffloadStartupState(
+                host_weight_plan=plan,
+                fresh_model_loader=lambda: canonical_pipeline,
+                allow_fresh_retry=True,
+            ),
+        )
+        monkeypatch.setattr(offloader_module, "get_offload_backend", fake_backend)
+
+        recovered, backend = offloader_module.enable_offload_backend(
+            SimpleNamespace(),
+            warm_pipeline,
+            device=torch.device("cpu"),
+        )
+
+        assert recovered is canonical_pipeline
+        assert backend is None
+        assert failing_backend.disabled
+        assert carrier.closed
+        assert calls == [plan, None]
 
     def test_hsdp_with_allgather_rejected(self):
         """HSDP + DLO + AllGather should raise ValueError (double sharding)."""

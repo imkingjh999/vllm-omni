@@ -25,6 +25,7 @@ from .sequential_backend import (
     remove_sequential_offload,
     sequential_offload_component,
 )
+from .startup import OffloadStartupState, take_offload_startup_state
 from .tensor_utils import (
     dtype_size,
     is_dtensor,
@@ -52,6 +53,9 @@ __all__ = [
     "apply_distributed_block_hook",
     "remove_distributed_block_hook",
     "get_offload_backend",
+    "enable_offload_backend",
+    "OffloadStartupState",
+    "take_offload_startup_state",
     "get_offload_plan",
     "get_blocks_attr_names",
     "get_blocks_from_dit",
@@ -137,3 +141,72 @@ def get_offload_backend(
     else:
         logger.error("Unknown offload strategy: %s", config.strategy)
         return None
+
+
+def enable_offload_backend(
+    od_config: OmniDiffusionConfig,
+    pipeline: torch.nn.Module,
+    device: torch.device | None = None,
+) -> tuple[torch.nn.Module, OffloadBackend | None]:
+    """Create and enable the loader-selected backend transactionally.
+
+    The model runner only calls this generic offloader boundary. Loader-owned
+    host plans and optional fresh-model recovery callbacks stay inside the
+    startup state consumed here.
+    """
+    startup_state = take_offload_startup_state(pipeline)
+    host_weight_plan = startup_state.host_weight_plan if startup_state is not None else None
+    backend: OffloadBackend | None = None
+    try:
+        backend = get_offload_backend(
+            od_config,
+            device=device,
+            host_weight_plan=host_weight_plan,
+        )
+        if backend is not None:
+            logger.info("Enabling offloader backend: %s", backend.__class__.__name__)
+            backend.enable(pipeline)
+        elif startup_state is not None:
+            startup_state.close_loader_ownership()
+        return pipeline, backend
+    except Exception:
+        if backend is not None:
+            try:
+                backend.disable()
+            except Exception:
+                logger.exception("Failed to clean up the offload backend after startup failure")
+        if startup_state is not None:
+            startup_state.close_loader_ownership()
+
+        if startup_state is None or not startup_state.allow_fresh_retry:
+            raise
+        assert startup_state.fresh_model_loader is not None
+        logger.warning(
+            "Loader-backed offload startup failed; retrying with a fresh canonical model",
+            exc_info=True,
+        )
+        del pipeline
+        pipeline = startup_state.fresh_model_loader()
+        fresh_state = take_offload_startup_state(pipeline)
+        fresh_plan = fresh_state.host_weight_plan if fresh_state is not None else None
+        try:
+            backend = get_offload_backend(
+                od_config,
+                device=device,
+                host_weight_plan=fresh_plan,
+            )
+            if backend is not None:
+                logger.info("Enabling canonical fallback offloader backend: %s", backend.__class__.__name__)
+                backend.enable(pipeline)
+            elif fresh_state is not None:
+                fresh_state.close_loader_ownership()
+        except Exception:
+            if backend is not None:
+                try:
+                    backend.disable()
+                except Exception:
+                    logger.exception("Failed to clean up the canonical fallback offload backend")
+            if fresh_state is not None:
+                fresh_state.close_loader_ownership()
+            raise
+        return pipeline, backend

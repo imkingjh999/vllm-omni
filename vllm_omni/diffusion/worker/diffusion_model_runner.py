@@ -49,7 +49,7 @@ from vllm_omni.diffusion.models.interface import (
     supports_prompt_update,
     supports_step_execution,
 )
-from vllm_omni.diffusion.offloader import get_offload_backend
+from vllm_omni.diffusion.offloader import enable_offload_backend
 from vllm_omni.diffusion.registry import _NO_CACHE_ACCELERATION
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.diffusion.sched.interface import (
@@ -311,56 +311,13 @@ class DiffusionModelRunner(OmniConnectorModelRunnerMixin):
                 f"{self.od_config.model_class_name} does not support that contract."
             )
 
-        # Apply CPU offloading. A warm final-layout HWR model remains in a
-        # disposable startup transaction until backend hooks, staging, and the
-        # initial prefetch are ready. If that transaction fails, preferred HWR
-        # constructs a fresh canonical model; required HWR propagates the
-        # failure after releasing the lease through its current owner.
-        host_weight_plan = model_loader.take_host_weight_plan()
-        self.offload_backend = None
-        try:
-            self.offload_backend = get_offload_backend(
-                self.od_config,
-                device=self.device,
-                host_weight_plan=host_weight_plan,
-            )
-            if self.offload_backend is not None:
-                logger.info(f" Enabling offloader backend: {self.offload_backend.__class__.__name__}")
-                self.offload_backend.enable(self.pipeline)
-        except Exception:
-            is_hwr_plan = host_weight_plan is not None and host_weight_plan.backing_kind == "host_weight_runtime"
-            hwr_mode = host_weight_plan.runtime_mode if host_weight_plan is not None else None
-            if self.offload_backend is not None:
-                try:
-                    self.offload_backend.disable()
-                except Exception:
-                    logger.exception("Failed to clean up the DLO backend after startup failure")
-            elif host_weight_plan is not None and host_weight_plan.lease_carrier is not None:
-                host_weight_plan.lease_carrier.close()
-
-            if not is_hwr_plan or hwr_mode == "required":
-                raise
-
-            logger.warning(
-                "HWR-backed DLO startup failed after restore; discarding the restored model and "
-                "retrying with a fresh canonical model",
-                exc_info=True,
-            )
-            failed_pipeline = self.pipeline
-            self.pipeline = None
-            del failed_pipeline
-            self.pipeline = model_loader.load_fresh_canonical_model()
-            self.offload_backend = get_offload_backend(
-                self.od_config,
-                device=self.device,
-                host_weight_plan=model_loader.take_host_weight_plan(),
-            )
-            if self.offload_backend is not None:
-                logger.info(
-                    "Enabling canonical fallback offloader backend: %s",
-                    self.offload_backend.__class__.__name__,
-                )
-                self.offload_backend.enable(self.pipeline)
+        # The offloader owns loader-plan handoff and startup recovery. The
+        # runner only receives the pipeline/backend pair that is ready to use.
+        self.pipeline, self.offload_backend = enable_offload_backend(
+            self.od_config,
+            self.pipeline,
+            device=self.device,
+        )
 
         # Apply torch.compile if not in eager mode
         if not self.od_config.enforce_eager:

@@ -825,9 +825,6 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
             del kwargs
             return SimpleNamespace(transformer=torch.nn.Identity())
 
-        def take_host_weight_plan(self):
-            return None
-
     class _DummyMemoryProfiler:
         consumed_memory = 0
 
@@ -869,8 +866,8 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _DummyMemoryProfiler)
     monkeypatch.setattr(
         model_runner_module,
-        "get_offload_backend",
-        lambda od_config, device, host_weight_plan: None,
+        "enable_offload_backend",
+        lambda od_config, pipeline, device: (pipeline, None),
     )
     monkeypatch.setattr(
         model_runner_module, "get_cache_backend", lambda cache_backend, cache_config: dummy_cache_backend
@@ -882,110 +879,6 @@ def test_load_model_clears_cache_backend_for_unsupported_pipeline(monkeypatch):
     assert runner.od_config.cache_backend is None
     assert dummy_cache_backend.enabled is False
 
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_load_model_retries_fresh_canonical_model_after_hwr_backend_failure(monkeypatch):
-    """A preferred warm HWR model is disposable until DLO setup succeeds."""
-
-    class _Carrier:
-        closed = False
-
-        def close(self):
-            self.closed = True
-
-    class _Plan:
-        backing_kind = "host_weight_runtime"
-        runtime_mode = "preferred"
-        lease_carrier = _Carrier()
-
-    class _DummyLoader:
-        instances = []
-
-        def __init__(self, load_config, od_config=None):
-            del load_config, od_config
-            self.fresh_calls = 0
-            self._plan = _Plan()
-            self.instances.append(self)
-
-        def load_model(self, **kwargs):
-            del kwargs
-            return SimpleNamespace(transformer=torch.nn.Identity(), generation="warm")
-
-        def take_host_weight_plan(self):
-            plan, self._plan = self._plan, None
-            return plan
-
-        def load_fresh_canonical_model(self):
-            self.fresh_calls += 1
-            return SimpleNamespace(transformer=torch.nn.Identity(), generation="canonical")
-
-    class _FailingBackend:
-        def __init__(self):
-            self.disabled = False
-
-        def enable(self, pipeline):
-            del pipeline
-            raise RuntimeError("prefetch failed")
-
-        def disable(self):
-            self.disabled = True
-
-    class _MemoryProfiler:
-        consumed_memory = 0
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, exc_type, exc, tb):
-            del exc_type, exc, tb
-            return False
-
-    failing_backend = _FailingBackend()
-    runner = object.__new__(DiffusionModelRunner)
-    runner.vllm_config = object()
-    runner.device = torch.device("cpu")
-    runner.pipeline = None
-    runner.cache_backend = None
-    runner.offload_backend = None
-    runner.prompt_embed_cache = None
-    runner.od_config = SimpleNamespace(
-        enable_cpu_offload=False,
-        enable_layerwise_offload=True,
-        enable_distributed_layerwise_offload=True,
-        cache_backend="none",
-        cache_config={},
-        model_class_name="DummyPipeline",
-        enforce_eager=True,
-        streaming_output=False,
-        step_execution=False,
-    )
-
-    monkeypatch.setattr(model_runner_module, "LoadConfig", lambda: object())
-    monkeypatch.setattr(model_runner_module, "DiffusersPipelineLoader", _DummyLoader)
-    monkeypatch.setattr(model_runner_module, "DeviceMemoryProfiler", _MemoryProfiler)
-    monkeypatch.setattr(
-        model_runner_module.current_omni_platform,
-        "init_diffusion_model_runner_runtime",
-        lambda **kwargs: None,
-    )
-    monkeypatch.setattr(
-        model_runner_module,
-        "get_offload_backend",
-        lambda od_config, device, host_weight_plan: failing_backend if host_weight_plan is not None else None,
-    )
-    monkeypatch.setattr(model_runner_module, "get_cache_backend", lambda *args: None)
-
-    DiffusionModelRunner.load_model(runner)
-
-    assert failing_backend.disabled
-    assert _DummyLoader.instances[0].fresh_calls == 1
-    assert runner.pipeline.generation == "canonical"
-    assert runner.offload_backend is None
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_set_forward_context_enters_vllm_config_contexts(monkeypatch):
     """Ensure `with set_forward_context(...):` enters vllm's context managers internally and calls desired vllm functions."""
     import vllm.config.vllm as vllm_config_module
