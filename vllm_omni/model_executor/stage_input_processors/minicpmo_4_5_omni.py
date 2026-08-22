@@ -125,20 +125,22 @@ def _coerce_int(value):
         return None
 
 
-def _codec_config(transfer_manager: Any) -> tuple[int, int]:
+def _codec_config(transfer_manager: Any) -> tuple[int, int, int]:
     connector = getattr(transfer_manager, "connector", None)
     raw_config = getattr(connector, "config", {}) or {}
     config = raw_config.get("extra", raw_config) if isinstance(raw_config, dict) else {}
     config = config if isinstance(config, dict) else {}
     chunk_frames = int(config.get("codec_chunk_frames", 25))
     left_context_frames = int(config.get("codec_left_context_frames", 3))
-    if chunk_frames <= 0 or left_context_frames < 0:
+    initial_frames = int(config.get("initial_codec_chunk_frames", 0))
+    if chunk_frames <= 0 or left_context_frames < 0 or initial_frames < 0:
         raise ValueError(
             "Invalid MiniCPM-o codec chunk config: "
             f"codec_chunk_frames={chunk_frames}, "
-            f"codec_left_context_frames={left_context_frames}"
+            f"codec_left_context_frames={left_context_frames}, "
+            f"initial_codec_chunk_frames={initial_frames}"
         )
-    return chunk_frames, left_context_frames
+    return chunk_frames, left_context_frames, initial_frames
 
 
 def _codec_scalars(value: Any) -> list[int]:
@@ -289,7 +291,12 @@ def tts2code2wav_async_chunk(
         state["segment_text_recorded"] = True
     request_finished = getattr(request, "is_finished", None)
     finished = bool(is_finished or (callable(request_finished) and request_finished()))
-    chunk_frames, left_context_frames = _codec_config(transfer_manager)
+    chunk_frames, left_context_frames, initial_frames = _codec_config(transfer_manager)
+    if int(record["chunk_seq"]) == 0 and 0 < initial_frames < chunk_frames:
+        # First chunk flushes early to cut TTFP; subsequent chunks fall back to
+        # the full codec_chunk_frames cadence. Must stay above the Code2Wav
+        # pre-lookahead width (codec_left_context_frames).
+        chunk_frames = initial_frames
     flush_pending = finished
     last_chunk = bool(flush_pending and (not native_duplex or turn_end))
     if not flush_pending and len(pending) < chunk_frames:
@@ -395,7 +402,7 @@ def tts2code2wav_full_payload(
     internal_id = getattr(request, "request_id", None)
     request_id = str(external_id if external_id is not None else internal_id)
     codes = _extract_codec_delta(pooling_output, request_id)
-    _, left_context_frames = _codec_config(transfer_manager)
+    _, left_context_frames, _ = _codec_config(transfer_manager)
     context = [_MINICPMO45_SILENCE_CODE] * left_context_frames if codes else []
     output_codes = [*context, *codes]
 

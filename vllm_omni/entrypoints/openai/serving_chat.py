@@ -390,6 +390,17 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         if self._diffusion_mode:
             return await self._create_diffusion_chat_completion(request, raw_request)
 
+        # MiniCPM-o: audio-output (TTS) requests default to thinking-off. The
+        # Thinker's think block is dead weight for speech synthesis and its
+        # occasional runaway (~1600 tok) blows TTFT p99; text-output requests
+        # (Daily/VideoMME, modalities=["text"]) keep default reasoning.
+        # setdefault: an explicit user value always wins.
+        _req_modalities = getattr(request, "modalities", None)
+        if _req_modalities is None or any(m == "audio" for m in _req_modalities):
+            _ctk = dict(request.chat_template_kwargs or {})
+            _ctk.setdefault("enable_thinking", False)
+            request.chat_template_kwargs = _ctk
+
         request_timestamp = time.time()
         if raw_request is not None:
             request_timestamp = float(getattr(raw_request.state, "request_timestamp", request_timestamp))
