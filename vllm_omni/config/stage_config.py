@@ -619,7 +619,18 @@ def _merge_platforms(
 
 
 def resolve_deploy_yaml(path: str | Path) -> dict[str, Any]:
-    """Load a deploy YAML with optional ``base_config`` inheritance."""
+    """Load a deploy YAML with optional ``base_config`` inheritance.
+
+    NPU perf defaults are applied here (not just in :func:`load_deploy_config`)
+    so every consumer of the raw dict — including the connector/transfer
+    config path in ``stage_init_utils.load_omni_transfer_config_for_model`` —
+    sees the tuned values.
+    """
+    return _apply_npu_perf_defaults(_resolve_deploy_yaml_raw(path))
+
+
+def _resolve_deploy_yaml_raw(path: str | Path) -> dict[str, Any]:
+    """Resolve ``base_config`` inheritance without perf-default injection."""
     raw_dict = to_dict(load_yaml_config(path))
 
     base_path = raw_dict.pop("base_config", None)
