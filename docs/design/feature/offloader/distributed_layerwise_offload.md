@@ -169,16 +169,26 @@ This mode means:
   copy per rank.
 - The scheduler does not require a synchronized DP request wave for DLO.
 
-### Planned final-layout Host Weight Runtime consumer
+### Final-layout Host Weight Runtime consumer
 
-> **Status:** PR2 design contract; not implemented in the current compatibility
-> matrix. The representation-independent identity, producer, and restoration
-> contracts landed in
-> [PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445).
+> **Status:** PR2 implementation. The representation-independent identity,
+> producer, and restoration contracts landed in
+> [PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445); this consumer
+> wires the final-layout BF16 path into eligible no-AllGather DLO.
 
-PR2 adds final-layout Host Weight Runtime (HWR) backing only for no-AllGather
-DLO. Registration of shared mappings and direct asynchronous H2D remain a
-separate PR3 transport change.
+Final-layout Host Weight Runtime (HWR) backing is opt-in and currently applies
+only to no-AllGather DLO. Enable it with
+`--host-weight-runtime-mode preferred` (or `required`) and
+`--host-weight-runtime-root <node-local-root>`. Registration of shared mappings
+and direct asynchronous H2D remain a separate PR3 transport change.
+
+The current producer/consumer boundary is the model-declared final-layout BF16
+contract (MiniMax H3 today). It supports ordinary-loader final layouts for TP1
+and TP2 rank identities plus SP layout identities; online quantization, HSDP,
+LoRA/adapted weights, and non-default load formats remain ineligible. HWR mode
+`disabled`, DLO-disabled, and DLO AllGather configurations stop before source
+identity or store construction and retain the existing checkpoint-mmap or
+ordinary-loader path.
 
 Eligibility is decided before constructing HWR, resolving canonical sources,
 hashing identity inputs, probing a filesystem, or emitting an HWR observer
@@ -277,6 +287,13 @@ duplicate `take()`. If the carrier still owns the lease, runner cleanup closes
 it. Once the backend takes ownership, only backend abort or teardown may drain
 work and close it.
 
+The implementation keeps the final-layout lease through backend setup and
+initial prefetch. The backend uses the existing two bounded rank-local staging
+slots for the immutable HWR tensors, and its transactional `enable()` cleanup
+removes partial hooks and closes the lease before reporting a setup failure.
+Preferred mode then uses the runner's fresh canonical retry; required mode
+propagates the failure.
+
 #### PR2 promotion gates
 
 - Warm hit performs zero ordinary DiT materialization and zero producer calls.
@@ -312,7 +329,8 @@ work and close it.
   the SP group becomes DLO's sharding group in AllGather mode.
 - **DP + TP/SP without AllGather:** standard model loading defines the
   rank-local tensor layout. DLO adds no cross-DP, cross-TP, or cross-SP weight
-  collective.
+  collective. When the model declares the final-layout contract, HWR keys the
+  reusable artifact by TP rank/size and SP layout.
 - **HSDP + SP:** the general parallel configuration permits HSDP over SP, but
   DLO must use `--dlo-no-use-allgather`. HSDP remains responsible for weight
   materialization and synchronization.

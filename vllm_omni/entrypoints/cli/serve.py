@@ -729,6 +729,20 @@ class OmniServeCommand(CLISubcommand):
             help="Keep this many leading main-DiT blocks resident on the device "
             "while distributed layerwise offload streams the remaining blocks.",
         )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-mode",
+            choices=("disabled", "preferred", "required"),
+            default="disabled",
+            help="Reuse exact final-layout host weights for eligible no-AllGather DLO "
+            "(disabled by default).",
+        )
+        omni_config_group.add_argument(
+            "--host-weight-runtime-root",
+            type=str,
+            default=None,
+            help="Node-local Host Weight Runtime store root. Required when the "
+            "runtime mode is preferred or required.",
+        )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
             "--boundary-ratio",

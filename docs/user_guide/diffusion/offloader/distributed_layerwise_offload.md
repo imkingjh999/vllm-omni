@@ -63,6 +63,8 @@ omni = Omni(
 | `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
 | `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
+| `--host-weight-runtime-mode {disabled,preferred,required}` | Reuse exact final-layout host weights for eligible no-AllGather DLO | `disabled` |
+| `--host-weight-runtime-root PATH` | Node-local Host Weight Runtime store root; required when HWR is enabled | unset |
 
 ## Host-weight loading
 
@@ -104,6 +106,31 @@ process.
 When the effective DLO group size is one, `dlo_use_allgather=True` does not
 perform a collective and uses the same rank-local transfer behavior.
 
+### Final-layout Host Weight Runtime
+
+HWR is an opt-in startup optimization for models that declare the final-layout
+BF16 restore contract. Use it only with no-AllGather DLO:
+
+```bash
+vllm serve /path/to/model --omni \
+  --enable-distributed-layerwise-offload \
+  --dlo-no-use-allgather \
+  --host-weight-runtime-mode preferred \
+  --host-weight-runtime-root /var/cache/vllm-omni/hwr
+```
+
+On a cold start, the canonical loader remains authoritative and publishes a
+validated final-layout artifact for later workers. A warm start restores the
+DiT final tensors without ordinary DiT materialization, then DLO streams them
+through the same two bounded host staging slots. The artifact identity includes
+the TP rank/size and SP layout, so TP1, TP2 rank-local shards, and distinct SP
+layouts do not alias one another. `required` fails if an exact artifact cannot
+be acquired; `preferred` falls back to canonical loading and keeps publication
+failure separate from the serving startup result.
+
+When HWR is disabled, DLO is disabled, or AllGather is enabled, the loader does
+not resolve HWR sources or construct its store.
+
 ## Declarative topology
 
 Models may declare an `OffloadPlan` instead of embedding offload logic:
@@ -135,7 +162,9 @@ must enter each collective.
 - Direct checkpoint mmap currently requires TP1. TP greater than one is
   outside the Phase A shared-mmap support scope and falls back before model
   mutation to the ordinary TP-aware loader. DLO can stream that runtime layout,
-  but it provides no shared-mmap host-memory benefit or guarantee.
+  and eligible no-AllGather configurations may use HWR final-layout artifacts,
+  but direct checkpoint mmap provides no shared-mmap host-memory guarantee for
+  TP greater than one.
 - HSDP plus AllGather is rejected to avoid double sharding. HSDP without
   AllGather has limited end-to-end validation.
 - Per-tensor online FP8 linears use the ordinary loader and can run with either
@@ -147,10 +176,10 @@ must enter each collective.
   `OffloadPlan` that declares eligible `resident_dit_paths`.
 - DP concurrency requires an explicit, identical inference-step count.
 
-Sharing transformed TP or quantized runtime layouts through a normalized mmap
-cache is a follow-up design in
+Sharing quantized or otherwise unvalidated transformed layouts through a
+normalized HWR producer is a follow-up design in
 [RFC #6195](https://github.com/vllm-project/vllm-omni/issues/6195), not part of
-the direct-checkpoint path.
+the current BF16 final-layout path.
 
 See the [Cosmos3 DistOffload recipe](https://github.com/vllm-project/vllm-omni/blob/main/recipes/cosmos3/Cosmos3-DistOffload.md)
 for an end-to-end example.

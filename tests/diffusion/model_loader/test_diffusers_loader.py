@@ -5,12 +5,14 @@
 Tests for the DiffusersPipelineLoader.
 """
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
+from safetensors.torch import save_file
 from vllm.config.load import LoadConfig
 
 from vllm_omni.diffusion.config import get_current_diffusion_config, get_current_diffusion_config_or_none
@@ -22,6 +24,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     TensorBinding,
 )
 from vllm_omni.diffusion.models.helios import HeliosPipeline
+from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.registry import initialize_model
 
 pytestmark = [pytest.mark.core_model, pytest.mark.diffusion, pytest.mark.cpu]
@@ -72,6 +75,46 @@ class _DummyPipelineModel(nn.Module):
         return loaded
 
 
+class _HWRTransformer(nn.Module):
+    host_weight_restore_contract = FinalLayoutModelContract(
+        implementation_id="test-hwr-transformer",
+        version="1",
+    )
+
+    def __init__(self):
+        super().__init__()
+        self.weight = nn.Parameter(torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2))
+
+    def validate_restored_host_weights(self):
+        assert self.weight.dtype is torch.bfloat16
+
+
+class _HWRPipeline(nn.Module):
+    def __init__(self, source_root: Path, loader_cls: type[DiffusersPipelineLoader]):
+        super().__init__()
+        self.transformer = _HWRTransformer()
+        self.load_count = 0
+        self.weights_sources = [
+            loader_cls.ComponentSource(
+                model_or_path=str(source_root),
+                subfolder=None,
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=False,
+            )
+        ]
+
+    def load_weights(self, weights):
+        loaded: set[str] = set()
+        params = dict(self.named_parameters())
+        for name, tensor in weights:
+            if name in params:
+                params[name].data.copy_(tensor.to(dtype=params[name].dtype))
+                loaded.add(name)
+        self.load_count += 1
+        return loaded
+
+
 def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoader:
     od_config = SimpleNamespace(
         dtype=torch.float32,
@@ -91,6 +134,129 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
     return loader
 
 
+@pytest.mark.parametrize(
+    ("tp_size", "tp_rank", "sp_size", "ulysses", "ring"),
+    [
+        (1, 0, 1, 1, 1),
+        (2, 0, 1, 1, 1),
+        (2, 1, 1, 1, 1),
+        (1, 0, 2, 2, 1),
+        (1, 0, 2, 1, 2),
+    ],
+)
+def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
+    tmp_path: Path,
+    monkeypatch,
+    tp_size,
+    tp_rank,
+    sp_size,
+    ulysses,
+    ring,
+):
+    canonical_root = tmp_path / "canonical"
+    canonical_root.mkdir()
+    save_file(
+        {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
+        str(canonical_root / "model.safetensors"),
+    )
+    store_root = tmp_path / f"hwr-store-tp{tp_size}-r{tp_rank}-sp{sp_size}"
+    monkeypatch.setattr("vllm.distributed.parallel_state.get_tensor_model_parallel_rank", lambda: tp_rank)
+
+    def make_loader() -> tuple[DiffusersPipelineLoader, _HWRPipeline]:
+        od_config = SimpleNamespace(
+            model=str(canonical_root),
+            dtype=torch.bfloat16,
+            host_weight_runtime_mode="preferred",
+            host_weight_runtime_root=str(store_root),
+            enable_distributed_layerwise_offload=True,
+            dlo_use_allgather=False,
+            lora_path=None,
+            quantization_config=None,
+            diffusion_attention_config=None,
+            parallel_config=SimpleNamespace(
+                use_hsdp=False,
+                data_parallel_size=1,
+                sequence_parallel_size=sp_size,
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=1,
+                cfg_parallel_size=1,
+                enable_expert_parallel=False,
+                ulysses_degree=ulysses,
+                ring_degree=ring,
+                allgather_degree=1,
+                ulysses_mode="strict",
+            ),
+        )
+        loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+        pipeline = _HWRPipeline(canonical_root, DiffusersPipelineLoader)
+        monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: pipeline)
+        return loader, pipeline
+
+    cold_loader, cold_model = make_loader()
+    cold = cold_loader.load_model(load_device="cpu", device=torch.device("cpu"))
+    assert cold is cold_model
+    assert cold_model.load_count == 1
+    assert cold_loader._hwr_state is not None
+    assert cold_loader._hwr_state["publication"].outcome.value == "published"
+
+    warm_loader, warm_model = make_loader()
+    monkeypatch.setattr(
+        warm_loader,
+        "_process_weights_after_loading",
+        lambda *args, **kwargs: pytest.fail("warm HWR restore re-entered byte-changing finalization"),
+    )
+    warm = warm_loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    assert warm is warm_model
+    assert warm_model.load_count == 0
+    assert torch.equal(warm_model.transformer.weight, cold_model.transformer.weight)
+    warm_plan = warm_loader.take_host_weight_plan()
+    assert warm_plan is not None
+    assert warm_plan.lease_carrier is not None
+    warm_plan.lease_carrier.close()
+
+
+def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
+    from vllm_omni.diffusion.model_loader import diffusers_loader as loader_module
+
+    od_config = SimpleNamespace(
+        model=str(tmp_path),
+        dtype=torch.bfloat16,
+        host_weight_runtime_mode="preferred",
+        host_weight_runtime_root=str(tmp_path / "store"),
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=False,
+        lora_path=None,
+        quantization_config=None,
+        parallel_config=SimpleNamespace(use_hsdp=False, data_parallel_size=1, sequence_parallel_size=1),
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    models: list[_DummyPipelineModel] = []
+
+    def init_model(*args, **kwargs):
+        del args, kwargs
+        model = _DummyPipelineModel(source_prefix="transformer.")
+        models.append(model)
+        return model
+
+    def commit_error(*args, **kwargs):
+        del args, kwargs
+        raise loader_module._HWRCommitError("restore commit failed")
+
+    monkeypatch.setattr(loader, "_init_from_load_format", init_model)
+    monkeypatch.setattr(loader, "_get_weight_sources", lambda model: ())
+    monkeypatch.setattr(loader, "_resolve_hwr", commit_error)
+    monkeypatch.setattr(loader, "load_weights", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loader, "_process_weights_after_loading", lambda *args, **kwargs: None)
+    monkeypatch.setattr(loader, "_apply_skip_softmax_calibration", lambda *args, **kwargs: None)
+
+    recovered = loader.load_model(load_device="cpu", device=torch.device("cpu"))
+
+    assert len(models) == 2
+    assert recovered is models[1]
+    assert loader.take_host_weight_plan() is None
+
+
 def _make_dlo_online_quant_config() -> OmniDiffusionConfig:
     return OmniDiffusionConfig(
         model="",
@@ -100,6 +266,86 @@ def _make_dlo_online_quant_config() -> OmniDiffusionConfig:
         enable_distributed_layerwise_offload=True,
         dlo_use_allgather=True,
     )
+
+
+@pytest.mark.parametrize(
+    ("dist_offload", "use_allgather"),
+    [
+        (False, False),
+        (True, True),
+    ],
+)
+def test_hwr_disabled_for_noneligible_dlo_paths_without_store_interaction(
+    monkeypatch,
+    tmp_path,
+    dist_offload,
+    use_allgather,
+):
+    """Disabled and AllGather paths must never construct or probe HWR."""
+    from vllm_omni.host_weight_runtime import HostWeightRuntime
+
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        model="dummy-model",
+        host_weight_runtime_mode="preferred",
+        host_weight_runtime_root=str(tmp_path / "must-not-be-touched"),
+        lora_path=None,
+        parallel_config=SimpleNamespace(
+            use_hsdp=False,
+            data_parallel_size=2,
+            sequence_parallel_size=1,
+        ),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = _DummyPipelineModel(source_prefix="transformer.")
+    modules = SimpleNamespace(dit_names=("transformer",), dits=(model.transformer,))
+
+    def unexpected_store_construction(*args, **kwargs):
+        raise AssertionError(f"HWR store interaction was not eligible: {args}, {kwargs}")
+
+    monkeypatch.setattr(HostWeightRuntime, "from_config", unexpected_store_construction)
+    assert (
+        loader._resolve_hwr(
+            model,
+            modules,
+            dist_offload=dist_offload,
+            use_allgather=use_allgather,
+            load_format="default",
+            sources=tuple(model.weights_sources),
+        )
+        is None
+    )
+    assert not (tmp_path / "must-not-be-touched").exists()
+
+
+def test_required_hwr_rejects_a_model_without_a_restore_contract(tmp_path):
+    od_config = SimpleNamespace(
+        dtype=torch.float32,
+        model="dummy-model",
+        host_weight_runtime_mode="required",
+        host_weight_runtime_root=str(tmp_path / "store"),
+        lora_path=None,
+        parallel_config=SimpleNamespace(
+            use_hsdp=False,
+            data_parallel_size=1,
+            sequence_parallel_size=1,
+        ),
+        quantization_config=None,
+    )
+    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    model = _DummyPipelineModel(source_prefix="transformer.")
+    modules = SimpleNamespace(dit_names=("transformer",), dits=(model.transformer,))
+
+    with pytest.raises(ValueError, match="restore contract"):
+        loader._resolve_hwr(
+            model,
+            modules,
+            dist_offload=True,
+            use_allgather=False,
+            load_format="default",
+            sources=tuple(model.weights_sources),
+        )
 
 
 def test_strict_check_only_validates_source_prefix_parameters():

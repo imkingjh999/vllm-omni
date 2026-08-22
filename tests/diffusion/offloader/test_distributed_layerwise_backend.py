@@ -859,6 +859,145 @@ class TestMmapWeightLoading:
         assert all(hook.rank_local_mmap for group in backend._all_hook_groups for hook in group)
         backend.disable()
 
+    def test_hwr_carrier_is_taken_and_released_after_bounded_staging(self, patched_offload_runtime):
+        """A warm HWR plan uses the existing two-slot rank-local transport."""
+
+        class Pipeline(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = _SingleBlockModel(num_blocks=3)
+
+        class FakeLease:
+            def __init__(self):
+                self.closed = False
+                self.provenance = SimpleNamespace(resolution_id="hwr-test")
+
+            def close(self):
+                self.closed = True
+
+        class FakeCarrier:
+            def __init__(self, lease):
+                self.lease = lease
+                self.taken = False
+
+            @property
+            def closed(self):
+                return self.taken or self.lease.closed
+
+            def take(self):
+                if self.taken:
+                    raise RuntimeError("already taken")
+                self.taken = True
+                return self.lease
+
+            def close(self):
+                if not self.taken:
+                    self.lease.close()
+
+        lease = FakeLease()
+        carrier = FakeCarrier(lease)
+        plan = HostWeightPlan(
+            backing_kind="host_weight_runtime",
+            bindings={},
+            lease_carrier=carrier,
+            runtime_mode="preferred",
+        )
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=1,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+        pipeline = Pipeline()
+        model_bytes = sum(param.numel() * param.element_size() for param in pipeline.transformer.parameters())
+
+        backend.enable(pipeline)
+
+        assert carrier.taken
+        assert backend._using_rank_local_mmap
+        assert all(len(hook.cpu_staging_buffers) == 2 for group in backend._all_hook_groups for hook in group)
+        staging_bytes = sum(
+            buffer.numel() * buffer.element_size()
+            for buffer in backend._all_hook_groups[0][0].cpu_staging_buffers[0].values()
+        )
+        assert staging_bytes * 2 < model_bytes
+        assert not lease.closed
+
+        backend.disable()
+        assert lease.closed
+
+    def test_hwr_backend_failure_drains_partial_setup_before_lease_close(
+        self,
+        monkeypatch,
+        patched_offload_runtime,
+    ):
+        class Pipeline(nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.transformer = _SingleBlockModel(num_blocks=3)
+
+        class FakeLease:
+            def __init__(self):
+                self.closed = False
+                self.provenance = SimpleNamespace(resolution_id="hwr-failure")
+
+            def close(self):
+                self.closed = True
+
+        class FakeCarrier:
+            def __init__(self, lease):
+                self.lease = lease
+                self.taken = False
+
+            @property
+            def closed(self):
+                return self.taken or self.lease.closed
+
+            def take(self):
+                self.taken = True
+                return self.lease
+
+            def close(self):
+                if not self.taken:
+                    self.lease.close()
+
+        lease = FakeLease()
+        carrier = FakeCarrier(lease)
+        plan = HostWeightPlan(
+            backing_kind="host_weight_runtime",
+            bindings={},
+            lease_carrier=carrier,
+            runtime_mode="preferred",
+        )
+        backend = DistributedLayerwiseOffloadBackend(
+            OffloadConfig(
+                strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+                pin_cpu_memory=False,
+                dp_size=1,
+                dlo_use_allgather=False,
+            ),
+            torch.device("cpu"),
+            host_weight_plan=plan,
+        )
+        monkeypatch.setattr(
+            backend,
+            "_allocate_shared_buffers",
+            lambda hooks: (_ for _ in ()).throw(RuntimeError("device buffer allocation failed")),
+        )
+
+        with pytest.raises(RuntimeError, match="device buffer allocation failed"):
+            backend.enable(Pipeline())
+
+        assert carrier.taken
+        assert lease.closed
+        assert not backend.enabled
+        assert not backend._blocks
+        assert not backend._all_hook_groups
+
 
 class TestGetBlocksFromDit:
     def test_get_blocks_from_dit_single_block_attr(self):
@@ -1524,6 +1663,72 @@ class TestMmapValidation:
 
 class TestConfigValidation:
     """Tests for configuration validation in OffloadConfig / execute_request."""
+
+    @pytest.mark.parametrize(
+        ("dp", "sp", "tp", "use_allgather", "expected_dlo_group"),
+        [
+            (1, 1, 1, True, 1),
+            (2, 1, 1, True, 2),
+            (1, 4, 1, True, 4),
+            (2, 2, 2, True, 2),
+            (2, 2, 2, False, 1),
+            (1, 4, 2, False, 1),
+        ],
+    )
+    def test_dlo_group_selection_covers_dp_sp_tp_matrix(
+        self,
+        dp,
+        sp,
+        tp,
+        use_allgather,
+        expected_dlo_group,
+    ):
+        """DLO sharding follows DP, falls back to SP, and never uses TP."""
+
+        class FakePC:
+            data_parallel_size = dp
+            use_hsdp = False
+            hsdp_shard_size = -1
+            hsdp_replicate_size = 1
+            sequence_parallel_size = sp
+            tensor_parallel_size = tp
+
+        class FakeODConfig:
+            enable_cpu_offload = False
+            enable_layerwise_offload = False
+            enable_distributed_layerwise_offload = True
+            dlo_use_allgather = use_allgather
+            dlo_resident_layers = 0
+            pin_cpu_memory = False
+            parallel_config = FakePC()
+
+        config = OffloadConfig.from_od_config(FakeODConfig())
+        assert config.dp_size == expected_dlo_group
+        assert config.dlo_use_allgather is use_allgather
+
+    @pytest.mark.parametrize("tp_rank", [0, 1])
+    def test_no_allgather_accepts_rank_local_tp2_configuration(self, tp_rank):
+        """TP2 remains loader-owned rank-local storage without a DLO collective."""
+
+        class FakePC:
+            data_parallel_size = 1
+            use_hsdp = False
+            sequence_parallel_size = 1
+            tensor_parallel_size = 2
+            tensor_parallel_rank = tp_rank
+
+        class FakeODConfig:
+            enable_cpu_offload = False
+            enable_layerwise_offload = False
+            enable_distributed_layerwise_offload = True
+            dlo_use_allgather = False
+            dlo_resident_layers = 0
+            pin_cpu_memory = False
+            parallel_config = FakePC()
+
+        config = OffloadConfig.from_od_config(FakeODConfig())
+        assert config.dp_size == 1
+        assert config.dlo_use_allgather is False
 
     def test_loader_plan_cannot_be_silently_dropped_on_unsupported_platform(self, monkeypatch):
         import vllm_omni.diffusion.offloader as offloader_module
