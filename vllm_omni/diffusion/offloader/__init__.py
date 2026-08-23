@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 from vllm.logger import init_logger
@@ -17,7 +17,7 @@ from .distributed_layerwise_backend import (
     remove_distributed_block_hook,
 )
 from .layerwise_backend import LayerWiseOffloadBackend
-from .module_residency import PinnedModuleStager
+from .module_residency import BoundedAllocatorCache, PinnedModuleStager
 from .offload_plan import OffloadPlan, get_offload_plan
 from .sequential_backend import (
     ModelLevelOffloadBackend,
@@ -45,6 +45,7 @@ __all__ = [
     "DistributedLayerwiseOffloadBackend",
     "DistributedLayerwiseOffloadHook",
     "ModelLevelOffloadBackend",
+    "BoundedAllocatorCache",
     "PinnedModuleStager",
     "apply_sequential_offload",
     "remove_sequential_offload",
