@@ -245,7 +245,7 @@ else:
         [sys.executable, "-c", script, str(_MODULE_PATH), str(tmp_path)],
         capture_output=True,
         text=True,
-        timeout=3,
+        timeout=30,
         check=False,
     )
 

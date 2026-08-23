@@ -552,6 +552,13 @@ def test_mot_qkv_und_mode(K: int, N: int, dtype: str, bias: bool):
         ).cuda()
 
         with torch.no_grad():
+            # vLLM linear layers leave weights uninitialized (torch.empty), so
+            # a freshly zeroed GPU page would make both outputs zero and the
+            # cosine-similarity gate degenerate. Seed deterministic values so
+            # und-mode is compared against a meaningful reference.
+            ref_linear.weight.normal_(mean=0.0, std=0.02)
+            if ref_linear.bias is not None:
+                ref_linear.bias.normal_(mean=0.0, std=0.02)
             mot_linear.weight.copy_(ref_linear.weight)
             if bias and ref_linear.bias is not None:
                 mot_linear.bias.copy_(ref_linear.bias)
@@ -600,6 +607,13 @@ def test_mot_row_und_mode(K: int, N: int, dtype: str, bias: bool):
         ).cuda()
 
         with torch.no_grad():
+            # vLLM linear layers leave weights uninitialized (torch.empty), so
+            # a freshly zeroed GPU page would make both outputs zero and the
+            # cosine-similarity gate degenerate. Seed deterministic values so
+            # und-mode is compared against a meaningful reference.
+            ref_linear.weight.normal_(mean=0.0, std=0.02)
+            if ref_linear.bias is not None:
+                ref_linear.bias.normal_(mean=0.0, std=0.02)
             mot_linear.weight.copy_(ref_linear.weight)
             if bias and ref_linear.bias is not None:
                 mot_linear.bias.copy_(ref_linear.bias)
