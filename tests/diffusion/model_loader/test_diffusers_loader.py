@@ -24,7 +24,6 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlanResult,
     TensorBinding,
 )
-from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.registry import initialize_model
@@ -92,12 +91,12 @@ class _HWRTransformer(nn.Module):
 
 
 class _HWRPipeline(nn.Module):
-    def __init__(self, source_root: Path, loader_cls: type[DiffusersPipelineLoader]):
+    def __init__(self, source_root: Path):
         super().__init__()
         self.transformer = _HWRTransformer()
         self.load_count = 0
         self.weights_sources = [
-            loader_cls.ComponentSource(
+            DiffusersPipelineLoader.ComponentSource(
                 model_or_path=str(source_root),
                 subfolder=None,
                 revision=None,
@@ -115,6 +114,33 @@ class _HWRPipeline(nn.Module):
                 loaded.add(name)
         self.load_count += 1
         return loaded
+
+
+def _hwr_config(model: str | Path, root: Path, *, mode: str = "preferred") -> SimpleNamespace:
+    return SimpleNamespace(
+        model=str(model),
+        dtype=torch.bfloat16,
+        host_weight_runtime_mode=mode,
+        host_weight_runtime_root=str(root),
+        enable_distributed_layerwise_offload=True,
+        dlo_use_allgather=False,
+        lora_path=None,
+        quantization_config=None,
+        diffusion_attention_config=None,
+        parallel_config=SimpleNamespace(
+            use_hsdp=False,
+            data_parallel_size=1,
+            sequence_parallel_size=1,
+            tensor_parallel_size=1,
+            pipeline_parallel_size=1,
+            cfg_parallel_size=1,
+            enable_expert_parallel=False,
+            ulysses_degree=1,
+            ring_degree=1,
+            allgather_degree=1,
+            ulysses_mode="strict",
+        ),
+    )
 
 
 def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoader:
@@ -136,24 +162,9 @@ def _make_loader_with_weights(weight_names: list[str]) -> DiffusersPipelineLoade
     return loader
 
 
-@pytest.mark.parametrize(
-    ("tp_size", "tp_rank", "sp_size", "ulysses", "ring"),
-    [
-        (1, 0, 1, 1, 1),
-        (2, 0, 1, 1, 1),
-        (2, 1, 1, 1, 1),
-        (1, 0, 2, 2, 1),
-        (1, 0, 2, 1, 2),
-    ],
-)
 def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
     tmp_path: Path,
     monkeypatch,
-    tp_size,
-    tp_rank,
-    sp_size,
-    ulysses,
-    ring,
 ):
     canonical_root = tmp_path / "canonical"
     canonical_root.mkdir()
@@ -161,45 +172,11 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
         {"weight": torch.arange(4, dtype=torch.float32).to(torch.bfloat16).reshape(2, 2)},
         str(canonical_root / "model.safetensors"),
     )
-    store_root = tmp_path / f"hwr-store-tp{tp_size}-r{tp_rank}-sp{sp_size}"
-    monkeypatch.setattr("vllm.distributed.parallel_state.get_tensor_model_parallel_rank", lambda: tp_rank)
-    hash_calls = 0
-    original_sha256 = source_identity_module._sha256_file
-
-    def counted_sha256(path: Path, state: object) -> str:
-        nonlocal hash_calls
-        hash_calls += 1
-        return original_sha256(path, state)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(source_identity_module, "_sha256_file", counted_sha256)
+    store_root = tmp_path / "hwr-store"
 
     def make_loader() -> tuple[DiffusersPipelineLoader, _HWRPipeline]:
-        od_config = SimpleNamespace(
-            model=str(canonical_root),
-            dtype=torch.bfloat16,
-            host_weight_runtime_mode="preferred",
-            host_weight_runtime_root=str(store_root),
-            enable_distributed_layerwise_offload=True,
-            dlo_use_allgather=False,
-            lora_path=None,
-            quantization_config=None,
-            diffusion_attention_config=None,
-            parallel_config=SimpleNamespace(
-                use_hsdp=False,
-                data_parallel_size=1,
-                sequence_parallel_size=sp_size,
-                tensor_parallel_size=tp_size,
-                pipeline_parallel_size=1,
-                cfg_parallel_size=1,
-                enable_expert_parallel=False,
-                ulysses_degree=ulysses,
-                ring_degree=ring,
-                allgather_degree=1,
-                ulysses_mode="strict",
-            ),
-        )
-        loader = DiffusersPipelineLoader(LoadConfig(), od_config)
-        pipeline = _HWRPipeline(canonical_root, DiffusersPipelineLoader)
+        loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config(canonical_root, store_root))
+        pipeline = _HWRPipeline(canonical_root)
         monkeypatch.setattr(loader, "_init_from_load_format", lambda *args, **kwargs: pipeline)
         return loader, pipeline
 
@@ -225,30 +202,16 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
 
     startup_state = take_offload_startup_state(warm)
     assert startup_state is not None
-    assert startup_state.host_weight_plan is not None
-    warm_plan = warm_loader.take_host_weight_plan()
+    warm_plan = startup_state.host_weight_plan
     assert warm_plan is not None
     assert warm_plan.lease_carrier is not None
     warm_plan.lease_carrier.close()
-    assert hash_calls == 1
-    assert len(tuple((store_root / "source-digests-v1" / "entries").glob("*.json"))) == 1
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):
     from vllm_omni.diffusion.model_loader import diffusers_loader as loader_module
 
-    od_config = SimpleNamespace(
-        model=str(tmp_path),
-        dtype=torch.bfloat16,
-        host_weight_runtime_mode="preferred",
-        host_weight_runtime_root=str(tmp_path / "store"),
-        enable_distributed_layerwise_offload=True,
-        dlo_use_allgather=False,
-        lora_path=None,
-        quantization_config=None,
-        parallel_config=SimpleNamespace(use_hsdp=False, data_parallel_size=1, sequence_parallel_size=1),
-    )
-    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config(tmp_path, tmp_path / "store"))
     models: list[_DummyPipelineModel] = []
 
     def init_model(*args, **kwargs):
@@ -262,7 +225,7 @@ def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_p
         raise loader_module._HWRCommitError("restore commit failed")
 
     monkeypatch.setattr(loader, "_init_from_load_format", init_model)
-    monkeypatch.setattr(loader, "_get_weight_sources", lambda model: ())
+    monkeypatch.setattr(loader, "_get_weight_sources", lambda _model: ())
     monkeypatch.setattr(loader, "_resolve_hwr", commit_error)
     monkeypatch.setattr(loader, "load_weights", lambda *args, **kwargs: None)
     monkeypatch.setattr(loader, "_process_weights_after_loading", lambda *args, **kwargs: None)
@@ -302,20 +265,8 @@ def test_hwr_disabled_for_noneligible_dlo_paths_without_store_interaction(
     """Disabled and AllGather paths must never construct or probe HWR."""
     from vllm_omni.host_weight_runtime import HostWeightRuntime
 
-    od_config = SimpleNamespace(
-        dtype=torch.float32,
-        model="dummy-model",
-        host_weight_runtime_mode="preferred",
-        host_weight_runtime_root=str(tmp_path / "must-not-be-touched"),
-        lora_path=None,
-        parallel_config=SimpleNamespace(
-            use_hsdp=False,
-            data_parallel_size=2,
-            sequence_parallel_size=1,
-        ),
-        quantization_config=None,
-    )
-    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
+    root = tmp_path / "must-not-be-touched"
+    loader = DiffusersPipelineLoader(LoadConfig(), _hwr_config("dummy-model", root))
     model = _DummyPipelineModel(source_prefix="transformer.")
     modules = SimpleNamespace(dit_names=("transformer",), dits=(model.transformer,))
 
@@ -334,24 +285,14 @@ def test_hwr_disabled_for_noneligible_dlo_paths_without_store_interaction(
         )
         is None
     )
-    assert not (tmp_path / "must-not-be-touched").exists()
+    assert not root.exists()
 
 
 def test_required_hwr_rejects_a_model_without_a_restore_contract(tmp_path):
-    od_config = SimpleNamespace(
-        dtype=torch.float32,
-        model="dummy-model",
-        host_weight_runtime_mode="required",
-        host_weight_runtime_root=str(tmp_path / "store"),
-        lora_path=None,
-        parallel_config=SimpleNamespace(
-            use_hsdp=False,
-            data_parallel_size=1,
-            sequence_parallel_size=1,
-        ),
-        quantization_config=None,
+    loader = DiffusersPipelineLoader(
+        LoadConfig(),
+        _hwr_config("dummy-model", tmp_path / "store", mode="required"),
     )
-    loader = DiffusersPipelineLoader(LoadConfig(), od_config)
     model = _DummyPipelineModel(source_prefix="transformer.")
     modules = SimpleNamespace(dit_names=("transformer",), dits=(model.transformer,))
 

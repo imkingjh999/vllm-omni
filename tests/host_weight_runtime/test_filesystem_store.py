@@ -118,25 +118,32 @@ def _direct_writer(tmp_path: Path) -> FilesystemArtifactWriter:
     return FilesystemArtifactWriter(staging, capacity_check=lambda _projected, _additional: None)
 
 
+def _write_ordered_payload(writer: FilesystemArtifactWriter) -> tuple[torch.Tensor, torch.Tensor]:
+    weight = _weight()
+    scale = torch.tensor([1.0, 2.0])
+    with writer.open_tensor_file("weights.safetensors", _specs(), ordered=True) as output:
+        output.write_tensor("layer.scale", scale)
+        output.write_rows("layer.weight", 0, weight[:2])
+        output.write_rows("layer.weight", 2, weight[2:])
+    return weight, scale
+
+
+def _finalize_writer(writer: FilesystemArtifactWriter):
+    return writer.finalize(_identity(), ProductionMetadata("test-producer-v1", "test-restorer-v1"))
+
+
 def test_ordered_writer_hashes_payload_during_writes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     writer = _direct_writer(tmp_path)
-    weight = _weight()
-    scale = torch.tensor([1.0, 2.0])
 
     def fail_rescan(_path: Path, _specs: tuple[TensorWriteSpec, ...]) -> object:
         raise AssertionError("ordered payload must not be rescanned")
 
     monkeypatch.setattr(filesystem_writer_module, "_scan_payload", fail_rescan)
-    with writer.open_tensor_file("weights.safetensors", _specs(), ordered=True) as output:
-        # The writer's ordered contract follows canonical storage-key order.
-        output.write_tensor("layer.scale", scale)
-        output.write_rows("layer.weight", 0, weight[:2])
-        output.write_rows("layer.weight", 2, weight[2:])
-
-    manifest, _ = writer.finalize(_identity(), ProductionMetadata("test-producer-v1", "test-restorer-v1"))
+    weight, scale = _write_ordered_payload(writer)
+    manifest, _ = _finalize_writer(writer)
 
     payload = writer.staging_dir / "weights.safetensors"
     assert manifest.files[0].sha256 == hashlib.sha256(payload.read_bytes()).hexdigest()
@@ -165,40 +172,19 @@ def test_payload_fsync_overlaps_producer_work(
     writer = _direct_writer(tmp_path)
     started = threading.Event()
     release = threading.Event()
-    closed = threading.Event()
     original_fsync = filesystem_writer_module._fsync_payload
 
     def blocking_fsync(fd: int) -> None:
         started.set()
-        if not release.wait(timeout=5):
+        if not release.wait(timeout=2):
             raise TimeoutError("test did not release payload fsync")
         original_fsync(fd)
 
     monkeypatch.setattr(filesystem_writer_module, "_fsync_payload", blocking_fsync)
-    output = writer.open_tensor_file("weights.safetensors", _specs(), ordered=True)
-    output.write_tensor("layer.scale", torch.tensor([1.0, 2.0]))
-    output.write_tensor("layer.weight", _weight())
-    close_errors: list[BaseException] = []
-
-    def close_output() -> None:
-        try:
-            output.close()
-        except BaseException as exc:
-            close_errors.append(exc)
-        finally:
-            closed.set()
-
-    close_thread = threading.Thread(target=close_output)
-    close_thread.start()
-    try:
-        assert started.wait(timeout=2)
-        assert closed.wait(timeout=1), "payload close waited for fsync instead of overlapping it"
-    finally:
-        release.set()
-        close_thread.join(timeout=5)
-
-    assert not close_errors
-    writer.finalize(_identity(), ProductionMetadata("test-producer-v1", "test-restorer-v1"))
+    _write_ordered_payload(writer)
+    assert started.wait(timeout=1)
+    release.set()
+    _finalize_writer(writer)
 
 
 def test_payload_fsync_failure_prevents_publication(
@@ -214,12 +200,10 @@ def test_payload_fsync_failure_prevents_publication(
             os.close(fd)
 
     monkeypatch.setattr(filesystem_writer_module, "_fsync_payload", failing_fsync)
-    with writer.open_tensor_file("weights.safetensors", _specs(), ordered=True) as output:
-        output.write_tensor("layer.scale", torch.tensor([1.0, 2.0]))
-        output.write_tensor("layer.weight", _weight())
+    _write_ordered_payload(writer)
 
     with pytest.raises(OSError, match="injected fsync failure"):
-        writer.finalize(_identity(), ProductionMetadata("test-producer-v1", "test-restorer-v1"))
+        _finalize_writer(writer)
 
     assert not (writer.staging_dir / "manifest.json").exists()
     assert not (writer.staging_dir / "READY.json").exists()
@@ -250,7 +234,7 @@ def test_unordered_payload_fallback_hashes_files_in_parallel(
         return original_scan(path, file_specs)
 
     monkeypatch.setattr(filesystem_writer_module, "_scan_payload", synchronized_scan)
-    manifest, _ = writer.finalize(_identity(), ProductionMetadata("test-producer-v1", "test-restorer-v1"))
+    manifest, _ = _finalize_writer(writer)
 
     assert len(manifest.files) == 2
     assert len(thread_ids) == 2

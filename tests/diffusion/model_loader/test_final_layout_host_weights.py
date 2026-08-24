@@ -586,47 +586,32 @@ def test_node_source_digest_cache_reuses_recovers_and_invalidates(
         return original_sha256(path, state)  # type: ignore[arg-type]
 
     monkeypatch.setattr(source_identity_module, "_sha256_file", counted_sha256)
-    first = _identity(
-        model,
-        source,
-        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
-    )
-    second = _identity(
-        model,
-        source,
-        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
-    )
+
+    def resolve() -> FinalLayoutIdentityContext:
+        cache = NodeSourceDigestCache(cache_root, timeout_seconds=1.0)
+        return _identity(model, source, source_digest_cache=cache)
+
+    first = resolve()
+    second = resolve()
 
     assert second.identity == first.identity
     assert calls == 1
 
     cache_entry = next((cache_root / "source-digests-v1" / "entries").glob("*.json"))
     cache_entry.write_text("not-json", encoding="utf-8")
-    recovered = _identity(
-        model,
-        source,
-        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
-    )
+    recovered = resolve()
     assert recovered.identity == first.identity
     assert calls == 2
 
     cache_document = json.loads(cache_entry.read_text(encoding="utf-8"))
     cache_document["content_id"] = f"sha256:{'0' * 64}"
     cache_entry.write_text(json.dumps(cache_document), encoding="utf-8")
-    checksum_recovered = _identity(
-        model,
-        source,
-        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
-    )
+    checksum_recovered = resolve()
     assert checksum_recovered.identity == first.identity
     assert calls == 3
 
     source.weight_files[0].write_bytes(b"changed-canonical-source-with-a-new-size")
-    changed = _identity(
-        model,
-        source,
-        source_digest_cache=NodeSourceDigestCache(cache_root, timeout_seconds=1.0),
-    )
+    changed = resolve()
     assert changed.identity != first.identity
     assert calls == 4
 
@@ -657,42 +642,36 @@ def test_source_identity_hashes_checkpoint_shards_in_parallel(
     assert len(thread_ids) == 2
 
 
-def test_source_digest_cache_lock_timeout_falls_back_to_direct_hashing(
+@pytest.mark.parametrize("failure", ["lock", "directory"])
+def test_source_digest_cache_unavailable_falls_back_to_direct_hashing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    failure: str,
 ) -> None:
     model = _TinyPipeline()
     source = _prepared_source(tmp_path)
-    cache = NodeSourceDigestCache(tmp_path / "store", timeout_seconds=0.01)
+    if failure == "lock":
+        cache = NodeSourceDigestCache(tmp_path / "store", timeout_seconds=0.01)
 
-    def unavailable_lock(*_args: object, **_kwargs: object) -> object:
-        raise source_identity_module.FileLockTimeoutError("busy")
+        def unavailable_lock(*_args: object, **_kwargs: object) -> object:
+            raise source_identity_module.FileLockTimeoutError("busy")
 
-    monkeypatch.setattr(source_identity_module, "FileLock", unavailable_lock)
+        monkeypatch.setattr(source_identity_module, "FileLock", unavailable_lock)
+    else:
+        original_mkdir = Path.mkdir
+
+        def failing_cache_mkdir(path: Path, *args: object, **kwargs: object) -> None:
+            if "source-digests-v1" in path.parts:
+                raise OSError("injected cache directory failure")
+            original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "mkdir", failing_cache_mkdir)
+        cache = NodeSourceDigestCache(tmp_path / "store", timeout_seconds=0.01)
+
     context = _identity(model, source, source_digest_cache=cache)
 
     assert context.identity.source.revision.startswith("content-")
     assert not tuple(cache.entries.glob("*.json"))
-
-
-def test_source_digest_cache_directory_failure_falls_back_to_direct_hashing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    model = _TinyPipeline()
-    source = _prepared_source(tmp_path)
-    original_mkdir = Path.mkdir
-
-    def failing_cache_mkdir(path: Path, *args: object, **kwargs: object) -> None:
-        if "source-digests-v1" in path.parts:
-            raise OSError("injected cache directory failure")
-        original_mkdir(path, *args, **kwargs)  # type: ignore[arg-type]
-
-    monkeypatch.setattr(Path, "mkdir", failing_cache_mkdir)
-    cache = NodeSourceDigestCache(tmp_path / "store", timeout_seconds=0.01)
-    context = _identity(model, source, source_digest_cache=cache)
-
-    assert context.identity.source.revision.startswith("content-")
 
 
 def test_local_hex_named_symlink_target_is_content_hashed_across_startups(tmp_path: Path) -> None:
@@ -876,9 +855,7 @@ def test_identity_uses_resolved_revision_and_exact_semantics(tmp_path: Path) -> 
 def test_parallel_identity_matrix_is_exact_for_tp_and_sp(tmp_path: Path, parallel: FinalLayoutParallelIdentity) -> None:
     """TP rank/size and SP backend are identity coordinates for HWR artifacts."""
     model = _TinyPipeline()
-    source = _prepared_source(
-        tmp_path, directory=f"parallel-{parallel.tensor_parallel_size}-{parallel.tensor_parallel_rank}"
-    )
+    source = _prepared_source(tmp_path)
     context = _identity(model, source, request=_request(parallel=parallel))
     layout = context.identity.layout
 
