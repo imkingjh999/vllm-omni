@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 import contextlib
 import dataclasses
 import glob
@@ -34,12 +34,12 @@ from vllm_omni.diffusion.distributed.hsdp import HSDPInferenceConfig, apply_hsdp
 from vllm_omni.diffusion.model_loader.checkpoint_adapters import (
     get_checkpoint_adapter,
 )
+from vllm_omni.diffusion.model_loader.host_weight_loader import HWRLoaderMixin, _HWRCommitError
 from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlan,
     build_checkpoint_mmap_plan,
     has_online_quantization,
 )
-from vllm_omni.diffusion.model_loader.hwr_loader import HWRLoaderMixin, _HWRCommitError
 from vllm_omni.diffusion.models.diffusers_adapter.pipeline_diffusers_adapter import DiffusersAdapterPipeline
 from vllm_omni.diffusion.offloader.module_collector import ModuleDiscovery
 from vllm_omni.diffusion.registry import initialize_model

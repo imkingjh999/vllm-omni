@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Final-layout Host Weight Runtime integration for diffusion loaders.
+"""Host Weight Runtime integration for diffusion model loaders.
 
 This mixin keeps HWR identity, restore, publication, and startup-recovery
 policy out of the ordinary diffusers loader.  The host loader supplies the
