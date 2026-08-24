@@ -182,6 +182,19 @@ only to no-AllGather DLO. Enable it with
 `--host-weight-runtime-root <node-local-root>`. Registration of shared mappings
 and direct asynchronous H2D remain a separate PR3 transport change.
 
+The modes express operator fallback policy, not different artifact formats:
+
+- `preferred` consumes an exact hit, but on a miss it allows canonical loading
+  followed by post-load publication. It is the normal population path.
+- `required` consumes the same exact artifact but fails startup on a miss or
+  unusable artifact. It never invokes canonical DiT fallback or post-load
+  publication and therefore cannot populate an empty store.
+
+PR2 has no separate prewarm command. Operators populate one matching producer
+cohort per node-local storage domain in `preferred` mode, then restart the same
+model revision and parallel layout with `required`. TP coordinates have distinct
+identities, while equivalent DP replicas share them.
+
 The current producer/consumer boundary is the model-declared final-layout BF16
 contract (MiniMax H3 today). It supports ordinary-loader final layouts for TP1
 and TP2 rank identities plus SP layout identities; online quantization, HSDP,

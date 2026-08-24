@@ -63,8 +63,8 @@ omni = Omni(
 | `--dlo-use-allgather` | Shard host weights and reconstruct with AllGather | `true` |
 | `--dlo-no-use-allgather` | Stream complete rank-local blocks without a DLO weight collective | `false` |
 | `--dlo-resident-layers N` | Keep N leading main-DiT blocks on device; requires no-AllGather and model-declared resident paths | `0` |
-| `--host-weight-runtime-mode {disabled,preferred,required}` | Reuse exact final-layout host weights for eligible no-AllGather DLO | `disabled` |
-| `--host-weight-runtime-root PATH` | Node-local Host Weight Runtime store root; required when HWR is enabled | unset |
+| `--host-weight-runtime-mode {disabled,preferred,required}` | HWR policy: no interaction, populate on a miss, or require an exact hit | `disabled` |
+| `--host-weight-runtime-root PATH` | Writable node-local HWR store shared by workers in one storage domain; required for `preferred` and `required` | unset |
 
 ## Host-weight loading
 
@@ -119,14 +119,71 @@ vllm serve /path/to/model --omni \
   --host-weight-runtime-root /var/cache/vllm-omni/hwr
 ```
 
+#### Choosing a mode
+
+| Mode | Exact local artifact hit | Miss or recoverable artifact/store problem | Intended use |
+| --- | --- | --- | --- |
+| `disabled` | HWR is not consulted | Use the existing checkpoint-mmap or ordinary-loader path | Default compatibility path |
+| `preferred` | Restore the final-layout artifact | Load canonically, serve with those tensors, and attempt to publish an artifact for the next startup | Normal deployment and store population |
+| `required` | Restore the final-layout artifact | Fail startup without canonical DiT fallback or publication | Enforce a pre-populated store in controlled rollouts or CI |
+
+Both enabled modes still fail on non-retryable configuration, identity, or
+compatibility errors. `preferred` is a fallback policy for a cache miss or a
+recoverable cache problem; it does not hide an invalid deployment.
+
+#### Populating a store for `required` mode
+
+`required` is deliberately consume-only. PR2 does not include a separate
+prewarm command, so populate each node-local storage domain with one matching
+`preferred` producer cohort:
+
+1. Choose a persistent, writable root visible to every diffusion worker in the
+   storage domain. Do not use a process-private temporary directory.
+2. Start the deployment with `preferred`, using the exact model revision,
+   dtype, TP size, SP configuration, and other weight-layout settings intended
+   for serving. No inference request is needed; publication happens during
+   model startup. Wait for the engine to become healthy, then shut it down
+   cleanly.
+3. Restart with the same arguments and root, changing only the mode to
+   `required`. A successful startup proves that every worker acquired a valid
+   artifact; a miss, corrupt artifact, or incompatible identity fails startup.
+4. Repeat the population start on every node or storage domain because this
+   store is node-local.
+
+For example:
+
+```bash
+# First startup: canonically load and populate the exact artifacts.
+vllm serve /path/to/model --omni \
+  --enable-distributed-layerwise-offload \
+  --dlo-no-use-allgather \
+  --host-weight-runtime-mode preferred \
+  --host-weight-runtime-root /var/cache/vllm-omni/hwr
+
+# After a healthy startup and clean shutdown, enforce cache hits.
+vllm serve /path/to/model --omni \
+  --enable-distributed-layerwise-offload \
+  --dlo-no-use-allgather \
+  --host-weight-runtime-mode required \
+  --host-weight-runtime-root /var/cache/vllm-omni/hwr
+```
+
+Include the same TP and SP layout flags in both commands. DP rank and DP size
+are excluded from artifact identity, so the population and serving DP sizes may
+differ and equivalent DP replicas share artifacts. TP rank is included, so a
+TP-N deployment normally needs N rank-specific artifacts in each storage
+domain; launching the matching TP cohort creates that set. If the model
+revision or layout changes, run `preferred` again for the new identity before
+returning to `required`.
+
 On a cold start, the canonical loader remains authoritative and publishes a
 validated final-layout artifact for later workers. A warm start restores the
 DiT final tensors without ordinary DiT materialization, then DLO streams them
 through the same two bounded host staging slots. The artifact identity includes
 the TP rank/size and SP layout, so TP1, TP2 rank-local shards, and distinct SP
-layouts do not alias one another. `required` fails if an exact artifact cannot
-be acquired; `preferred` falls back to canonical loading and keeps publication
-failure separate from the serving startup result.
+layouts do not alias one another. Publication failure remains separate from a
+`preferred` serving startup; the next `required` startup provides the explicit
+artifact-availability check.
 
 For local canonical checkpoints, the first eligible worker may hash source
 shards to establish immutable identity. HWR caches those digests in the same

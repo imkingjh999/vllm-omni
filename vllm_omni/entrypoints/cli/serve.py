@@ -742,13 +742,23 @@ class OmniServeCommand(CLISubcommand):
             "--host-weight-runtime-mode",
             choices=("disabled", "preferred", "required"),
             default="disabled",
-            help="Reuse exact final-layout host weights for eligible no-AllGather DLO (disabled by default).",
+            help=(
+                "Host Weight Runtime policy for eligible no-AllGather DLO: "
+                "disabled does not consult HWR; preferred restores an exact hit "
+                "or canonically loads and publishes on a miss; required restores "
+                "an exact hit or fails startup. Populate a required store with "
+                "preferred first."
+            ),
         )
         omni_config_group.add_argument(
             "--host-weight-runtime-root",
             type=str,
             default=None,
-            help="Node-local Host Weight Runtime store root. Required when the runtime mode is preferred or required.",
+            help=(
+                "Writable node-local Host Weight Runtime store shared by workers "
+                "in one storage domain. Required for preferred and required; use "
+                "the same persistent path for population and serving."
+            ),
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(
