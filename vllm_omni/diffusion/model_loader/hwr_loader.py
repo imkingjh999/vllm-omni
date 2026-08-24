@@ -238,8 +238,7 @@ class HWRLoaderMixin:
             "quantization": self._identity_value(self.quant_config),
         }
         contracts = [
-            self._identity_value(getattr(dit, "host_weight_restore_contract"))
-            for dit in getattr(modules, "dits", ())
+            self._identity_value(getattr(dit, "host_weight_restore_contract")) for dit in getattr(modules, "dits", ())
         ]
         loader_identity = FinalLayoutLoaderIdentity(
             implementation=ImplementationIdentity(
