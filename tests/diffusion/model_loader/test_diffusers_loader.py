@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """
 Tests for the DiffusersPipelineLoader.
@@ -23,6 +23,7 @@ from vllm_omni.diffusion.model_loader.host_weight_plan import (
     HostWeightPlanResult,
     TensorBinding,
 )
+from vllm_omni.diffusion.model_loader.host_weights import source_identity as source_identity_module
 from vllm_omni.diffusion.models.helios import HeliosPipeline
 from vllm_omni.diffusion.models.host_weight_contract import FinalLayoutModelContract
 from vllm_omni.diffusion.registry import initialize_model
@@ -161,6 +162,15 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
     )
     store_root = tmp_path / f"hwr-store-tp{tp_size}-r{tp_rank}-sp{sp_size}"
     monkeypatch.setattr("vllm.distributed.parallel_state.get_tensor_model_parallel_rank", lambda: tp_rank)
+    hash_calls = 0
+    original_sha256 = source_identity_module._sha256_file
+
+    def counted_sha256(path: Path, state: object) -> str:
+        nonlocal hash_calls
+        hash_calls += 1
+        return original_sha256(path, state)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(source_identity_module, "_sha256_file", counted_sha256)
 
     def make_loader() -> tuple[DiffusersPipelineLoader, _HWRPipeline]:
         od_config = SimpleNamespace(
@@ -219,6 +229,8 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
     assert warm_plan is not None
     assert warm_plan.lease_carrier is not None
     warm_plan.lease_carrier.close()
+    assert hash_calls == 1
+    assert len(tuple((store_root / "source-digests-v1" / "entries").glob("*.json"))) == 1
 
 
 def test_hwr_commit_failure_discards_model_and_reloads_without_hwr_or_mmap(tmp_path: Path, monkeypatch):

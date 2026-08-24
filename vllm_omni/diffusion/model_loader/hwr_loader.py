@@ -15,7 +15,7 @@ import hashlib
 import os
 from collections.abc import Iterable, Sequence
 from pathlib import Path
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -24,6 +24,14 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.model_loader.host_weight_plan import HostWeightPlan, TensorBinding
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm_omni.diffusion.model_loader.host_weights.identity_adapter import FinalLayoutIdentityContext
+    from vllm_omni.diffusion.model_loader.host_weights.source_identity import (
+        NodeSourceDigestCache,
+        PreparedWeightSource,
+    )
+    from vllm_omni.host_weight_runtime import HostWeightResolution, HostWeightRuntime, RuntimeMode
 
 
 class _HWRCommitError(RuntimeError):
@@ -150,7 +158,7 @@ class HWRLoaderMixin:
         model: nn.Module,
         modules: object,
         sources: Sequence[object],
-    ) -> tuple[object, ...]:
+    ) -> tuple[PreparedWeightSource, ...]:
         from vllm_omni.diffusion.model_loader.host_weights import (
             ImplementationIdentity,
             PreparedWeightSource,
@@ -211,7 +219,8 @@ class HWRLoaderMixin:
         *,
         load_format: str,
         sources: Sequence[object],
-    ) -> object:
+        source_digest_cache: NodeSourceDigestCache | None = None,
+    ) -> FinalLayoutIdentityContext:
         from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 
         from vllm_omni.diffusion.model_loader.host_weights import (
@@ -289,7 +298,47 @@ class HWRLoaderMixin:
             prepared_sources=prepared_sources,
             request=request,
             policy=FINAL_LAYOUT_BF16_POLICY,
+            source_digest_cache=source_digest_cache,
         )
+
+    def _build_hwr_runtime(
+        self,
+        mode: RuntimeMode,
+        *,
+        allow_local_build: bool,
+        allow_post_load_publish: bool = False,
+    ) -> HostWeightRuntime:
+        from vllm_omni.host_weight_runtime import (
+            HostWeightRuntime,
+            HostWeightRuntimeConfig,
+            ProductionPolicy,
+            StorageDomainPolicy,
+        )
+        from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
+
+        root_value = getattr(self.od_config, "host_weight_runtime_root", None)
+        if not isinstance(root_value, str) or not root_value.strip():
+            raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
+        root = Path(root_value).expanduser()
+        return HostWeightRuntime.from_config(
+            HostWeightRuntimeConfig(
+                mode=mode,
+                domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
+                production=ProductionPolicy(
+                    allow_local_build=allow_local_build,
+                    allow_post_load_publish=allow_post_load_publish,
+                ),
+            )
+        )
+
+    @staticmethod
+    def _resolution_failure(resolution: HostWeightResolution) -> str:
+        report = resolution.report
+        failure = next(
+            (attempt.failure for attempt in reversed(report.attempts) if attempt.failure is not None),
+            None,
+        )
+        return failure.message if failure is not None else f"{report.outcome.value} without a typed detail"
 
     def _resolve_hwr(
         self,
@@ -302,17 +351,15 @@ class HWRLoaderMixin:
         sources: Sequence[object],
     ) -> dict[str, object] | None:
         """Resolve an eligible no-AllGather final-layout HWR transaction."""
-        from vllm_omni.diffusion.model_loader.host_weights import FinalLayoutTensorRestorer
+        from vllm_omni.diffusion.model_loader.host_weights import (
+            FinalLayoutTensorRestorer,
+            NodeSourceDigestCache,
+        )
         from vllm_omni.host_weight_runtime import (
             HostWeightLeaseCarrier,
-            HostWeightRuntime,
-            HostWeightRuntimeConfig,
-            ProductionPolicy,
             ResolutionOutcome,
             RuntimeMode,
-            StorageDomainPolicy,
         )
-        from vllm_omni.host_weight_runtime.filesystem import detect_storage_class
 
         mode = self._hwr_eligibility_mode(
             model,
@@ -343,17 +390,24 @@ class HWRLoaderMixin:
                 raise ValueError(f"required Host Weight Runtime path is ineligible: {message}")
             logger.info("Host Weight Runtime is ineligible; using the canonical DLO path: %s", message)
             return None
-        context = self._build_hwr_context(model, modules, load_format=load_format, sources=sources)
-        root_value = getattr(self.od_config, "host_weight_runtime_root", None)
-        if not isinstance(root_value, str) or not root_value.strip():
-            raise ValueError("enabled Host Weight Runtime requires host_weight_runtime_root")
-        root = Path(root_value).expanduser()
-        runtime_config = HostWeightRuntimeConfig(
-            mode=mode,
-            domain=StorageDomainPolicy(root=root, storage_class=detect_storage_class(root)),
-            production=ProductionPolicy(allow_local_build=False, allow_post_load_publish=True),
+        runtime = self._build_hwr_runtime(
+            mode,
+            allow_local_build=False,
+            allow_post_load_publish=True,
         )
-        runtime = HostWeightRuntime.from_config(runtime_config)
+        domain = runtime.config.domain
+        assert domain is not None
+        source_digest_cache = NodeSourceDigestCache(
+            domain.root,
+            timeout_seconds=runtime.config.wait.coordination_timeout_seconds,
+        )
+        context = self._build_hwr_context(
+            model,
+            modules,
+            load_format=load_format,
+            sources=sources,
+            source_digest_cache=source_digest_cache,
+        )
         resolution = runtime.resolve(context.identity)
         state: dict[str, object] = {
             "mode": mode,
@@ -363,12 +417,7 @@ class HWRLoaderMixin:
             "outcome": resolution.report.outcome,
         }
         if resolution.report.outcome is ResolutionOutcome.FAILED:
-            failure = next(
-                (attempt.failure for attempt in reversed(resolution.report.attempts) if attempt.failure is not None),
-                None,
-            )
-            detail = failure.message if failure is not None else "resolution failed without a typed detail"
-            raise RuntimeError(f"Host Weight Runtime resolution failed: {detail}")
+            raise RuntimeError(f"Host Weight Runtime resolution failed: {self._resolution_failure(resolution)}")
         if resolution.report.outcome is not ResolutionOutcome.LOCAL_HIT:
             return state
 

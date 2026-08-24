@@ -216,6 +216,23 @@ outcomes are authoritative:
 Checkpoint mmap remains an unchanged control path whenever final-layout HWR is
 not selected.
 
+Local source identity and publication avoid repeated full-payload passes while
+preserving the same semantic contract:
+
+- Canonical files without a trusted immutable Hub blob identity are hashed in
+  parallel. Their content IDs are cached per storage domain under the HWR root
+  and reused only when the path, inode, size, timestamps, symlink target, and
+  cache-record checksum still match. Corrupt entries are rebuilt; cache-lock or
+  cache-I/O failure falls back to hashing the canonical file directly.
+- Producers that emit payload bytes in canonical storage-key order may declare
+  `ordered=True`. The filesystem writer then computes file and tensor SHA256
+  values during the write and overlaps payload `fsync` with later producer
+  work. Producers without that guarantee retain unordered writes and use a
+  parallel readback checksum fallback.
+- Manifest and `READY` publication still wait for every payload `fsync` and
+  checksum to complete. These optimizations do not weaken artifact validation
+  or change lease ownership.
+
 #### Pre-service transaction boundary
 
 The startup transaction does not end at restore commit. A lease-backed model is
@@ -359,8 +376,8 @@ runtime layouts are validated.
 The Host Weight Runtime representation and publication contracts are merged;
 see [RFC #6414](https://github.com/vllm-project/vllm-omni/issues/6414) and
 [PR #6445](https://github.com/vllm-project/vllm-omni/pull/6445). The planned
-no-AllGather consumer above remains outside the current implementation and
-compatibility claims until PR2 satisfies its promotion gates.
+no-AllGather consumer above is the PR2 implementation; registration and direct
+asynchronous H2D remain a separate transport follow-up.
 
 ## Validation coverage
 
@@ -373,6 +390,8 @@ Current source-level validation includes:
 - ordinary-loader fallback for per-tensor online FP8 linears followed by DLO
   sharding of finalized weights and scales;
 - exact loader-to-backend plan transfer and ordinary-loader fallback;
+- ordered publication hashing, overlapped durability, unordered parallel
+  checksum fallback, and node-local source-digest reuse/invalidation;
 - rank-local mmap source retention, bounded two-slot staging, and adapter
   transforms without parameter-side flags;
 - resident-layer requests requiring no-AllGather;
