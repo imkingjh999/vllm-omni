@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import torch
 from vllm.logger import init_logger
@@ -154,30 +154,35 @@ def enable_offload_backend(
     host plans and optional fresh-model recovery callbacks stay inside the
     startup state consumed here.
     """
-    startup_state = take_offload_startup_state(pipeline)
-    host_weight_plan = startup_state.host_weight_plan if startup_state is not None else None
-    backend: OffloadBackend | None = None
-    try:
-        backend = get_offload_backend(
-            od_config,
-            device=device,
-            host_weight_plan=host_weight_plan,
-        )
-        if backend is not None:
-            logger.info("Enabling offloader backend: %s", backend.__class__.__name__)
-            backend.enable(pipeline)
-        elif startup_state is not None:
-            startup_state.close_loader_ownership()
-        return pipeline, backend
-    except Exception:
-        if backend is not None:
-            try:
-                backend.disable()
-            except Exception:
-                logger.exception("Failed to clean up the offload backend after startup failure")
-        if startup_state is not None:
-            startup_state.close_loader_ownership()
 
+    def enable_once(model: torch.nn.Module, state: OffloadStartupState | None) -> OffloadBackend | None:
+        backend: OffloadBackend | None = None
+        try:
+            backend = get_offload_backend(
+                od_config,
+                device=device,
+                host_weight_plan=state.host_weight_plan if state is not None else None,
+            )
+            if backend is not None:
+                logger.info("Enabling offloader backend: %s", backend.__class__.__name__)
+                backend.enable(model)
+            elif state is not None:
+                state.close_loader_ownership()
+            return backend
+        except Exception:
+            if backend is not None:
+                try:
+                    backend.disable()
+                except Exception:
+                    logger.exception("Failed to clean up the offload backend after startup failure")
+            if state is not None:
+                state.close_loader_ownership()
+            raise
+
+    startup_state = take_offload_startup_state(pipeline)
+    try:
+        return pipeline, enable_once(pipeline, startup_state)
+    except Exception:
         if startup_state is None or not startup_state.allow_fresh_retry:
             raise
         assert startup_state.fresh_model_loader is not None
@@ -187,26 +192,4 @@ def enable_offload_backend(
         )
         del pipeline
         pipeline = startup_state.fresh_model_loader()
-        fresh_state = take_offload_startup_state(pipeline)
-        fresh_plan = fresh_state.host_weight_plan if fresh_state is not None else None
-        try:
-            backend = get_offload_backend(
-                od_config,
-                device=device,
-                host_weight_plan=fresh_plan,
-            )
-            if backend is not None:
-                logger.info("Enabling canonical fallback offloader backend: %s", backend.__class__.__name__)
-                backend.enable(pipeline)
-            elif fresh_state is not None:
-                fresh_state.close_loader_ownership()
-        except Exception:
-            if backend is not None:
-                try:
-                    backend.disable()
-                except Exception:
-                    logger.exception("Failed to clean up the canonical fallback offload backend")
-            if fresh_state is not None:
-                fresh_state.close_loader_ownership()
-            raise
-        return pipeline, backend
+        return pipeline, enable_once(pipeline, take_offload_startup_state(pipeline))

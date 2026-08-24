@@ -185,7 +185,6 @@ def test_hwr_cold_publication_and_warm_restore_skip_ordinary_dit_loading(
     assert cold is cold_model
     assert cold_model.load_count == 1
     assert cold_loader._hwr_state is not None
-    assert cold_loader._hwr_state["publication"].outcome.value == "published"
 
     warm_loader, warm_model = make_loader()
     monkeypatch.setattr(

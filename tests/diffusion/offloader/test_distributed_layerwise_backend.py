@@ -738,7 +738,6 @@ def _fake_hwr_plan(resolution_id: str = "hwr-test"):
         backing_kind="host_weight_runtime",
         bindings={},
         lease_carrier=carrier,
-        runtime_mode="preferred",
     )
     return plan, carrier, lease
 

@@ -185,14 +185,6 @@ layouts do not alias one another. Publication failure remains separate from a
 `preferred` serving startup; the next `required` startup provides the explicit
 artifact-availability check.
 
-For local canonical checkpoints, the first eligible worker may hash source
-shards to establish immutable identity. HWR caches those digests in the same
-node-local storage domain and validates file metadata before reuse, so later
-workers normally avoid repeating that read. Cold BF16 publication also hashes
-ordered payloads as they are written and overlaps payload durability work with
-later shards; this changes startup work only, not artifact contents or runtime
-H2D behavior.
-
 When HWR is disabled, DLO is disabled, or AllGather is enabled, the loader does
 not resolve HWR sources or construct its store.
 

@@ -88,8 +88,6 @@ class ArtifactWriter(Protocol):
         self,
         relative_name: str,
         specs: tuple[TensorWriteSpec, ...],
-        *,
-        ordered: bool = False,
     ) -> TensorFileWriter: ...
 
 
