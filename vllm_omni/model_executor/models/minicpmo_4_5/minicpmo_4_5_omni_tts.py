@@ -67,46 +67,55 @@ def _restore_weight_norm_weight(weight_g: torch.Tensor, weight_v: torch.Tensor) 
     return torch._weight_norm(weight_v, weight_g, dim=0)
 
 
-def _apply_repetition_penalty(
+def _sample_codec_token(
     logits: torch.Tensor,
     history: torch.Tensor,
     *,
     penalty: float,
     window_size: int,
-) -> torch.Tensor:
-    """Match MiniCPMTTS' frequency-aware repetition penalty."""
-    if penalty == 1.0 or history.numel() == 0:
-        return logits
-    recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
-    frequencies = torch.bincount(recent, minlength=logits.shape[-1]).to(dtype=logits.dtype)
-    alpha = torch.pow(torch.as_tensor(penalty, device=logits.device, dtype=logits.dtype), frequencies)
-    return torch.where(logits < 0, logits * alpha, logits / alpha)
-
-
-def _apply_top_k_top_p(
-    logits: torch.Tensor,
-    *,
     top_k: int | None,
     top_p: float | None,
     min_tokens_to_keep: int = 3,
+    eos_id: int | None = None,
+    generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Apply the same candidate floors as the upstream Transformers warpers."""
-    filtered = logits.clone()
-    vocab_size = filtered.shape[-1]
-    # MiniCPM-o's gen_logits() appends TopPLogitsWarper before
-    # TopKLogitsWarper. The order is observable for fixed-seed sampling.
+    """Fused repetition-penalty + top-k/top-p codec sampling.
+
+    Distribution-equivalent to the upstream warper chain, but every
+    intermediate stays O(window)/O(top_k) instead of O(vocab):
+
+    * repetition penalty touches only the <=window recent tokens (scatter),
+      not a full-vocab bincount/pow/where;
+    * top-p keeps the descending-logit prefix whose full-softmax prefix mass
+      is below top_p (computed from a single logsumexp + topk), then top-k
+      truncates the same prefix -- their intersection is exactly the first
+      min(m, k) descending-logit tokens;
+    * multinomial runs over the <=k kept tokens (zero-masked beyond the
+      top-p cut) with no added host synchronization.
+    """
+    logits = logits.clone()
+    if penalty != 1.0 and history.numel() > 0:
+        recent = history.reshape(-1)[-window_size:].to(device=logits.device, dtype=torch.long)
+        uniq, counts = torch.unique(recent, return_counts=True)
+        alpha = torch.pow(torch.full_like(counts, penalty, dtype=logits.dtype), counts.to(logits.dtype))
+        hit = logits[..., uniq]
+        logits[..., uniq] = torch.where(hit < 0, hit * alpha, hit / alpha)
+    if eos_id is not None:
+        logits[..., eos_id] = float("-inf")
+    vocab_size = logits.shape[-1]
+    keep = vocab_size if top_k is None or top_k <= 0 else min(vocab_size, max(int(top_k), min_tokens_to_keep))
+    topv, topi = torch.topk(logits, keep, dim=-1)
     if top_p is not None and 0.0 < top_p < 1.0:
-        sorted_logits, sorted_indices = torch.sort(filtered, descending=False, dim=-1)
-        cumulative_probs = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
-        remove = cumulative_probs <= (1.0 - float(top_p))
-        remove[..., -min_tokens_to_keep:] = False
-        remove = remove.scatter(-1, sorted_indices, remove)
-        filtered.masked_fill_(remove, float("-inf"))
-    if top_k is not None and top_k > 0:
-        keep = min(vocab_size, max(int(top_k), min_tokens_to_keep))
-        threshold = torch.topk(filtered, keep, dim=-1).values[..., -1, None]
-        filtered.masked_fill_(filtered < threshold, float("-inf"))
-    return filtered
+        lse = torch.logsumexp(logits, dim=-1)
+        probs = torch.softmax(topv - lse, dim=-1)
+        prefix_before = probs.cumsum(dim=-1) - probs
+        mask = prefix_before < float(top_p)
+        mask[..., :min_tokens_to_keep] = True
+        probs = torch.where(mask, probs, torch.zeros_like(probs))
+    else:
+        probs = torch.softmax(topv, dim=-1)
+    idx = torch.multinomial(probs, num_samples=1, generator=generator)
+    return topi.gather(-1, idx).reshape(())
 
 
 class _MiniCPMTTSProjector(nn.Module):
@@ -433,36 +442,27 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         device,
     ) -> torch.Tensor:
         eos_id = self._num_audio_tokens - 1
-        logits = _apply_repetition_penalty(
-            logits,
-            history,
-            penalty=self._codec_repetition_penalty,
-            window_size=_REPETITION_WINDOW,
-        )
         request_states = getattr(self, "_request_audio_states", {})
         state = request_states.get(request_id)
         min_tokens = (
             int(state.get("min_tokens", self._codec_min_tokens)) if isinstance(state, dict) else self._codec_min_tokens
         )
-        if step < min_tokens:
-            logits[..., eos_id] = float("-inf")
-        logits = _apply_top_k_top_p(
-            logits,
-            top_k=self._codec_top_k,
-            top_p=self._codec_top_p,
-            min_tokens_to_keep=3,
-        )
-        probabilities = torch.softmax(logits, dim=-1)
         generator = (
             self._request_generator_cpu(request_id)
             if device == "cpu"
-            else self._request_generator(request_id, probabilities.device)
+            else self._request_generator(request_id, logits.device)
         )
-        return torch.multinomial(
-            probabilities,
-            num_samples=1,
+        return _sample_codec_token(
+            logits,
+            history,
+            penalty=self._codec_repetition_penalty,
+            window_size=_REPETITION_WINDOW,
+            top_k=self._codec_top_k,
+            top_p=self._codec_top_p,
+            min_tokens_to_keep=3,
+            eos_id=eos_id if step < min_tokens else None,
             generator=generator,
-        ).reshape(())
+        )
 
     def make_omni_output(
         self,
