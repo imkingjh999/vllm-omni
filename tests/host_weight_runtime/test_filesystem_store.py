@@ -1172,7 +1172,9 @@ def test_store_and_free_space_capacity_limits_fail_before_publication(tmp_path: 
 
     free_root = tmp_path / "free-limit"
     free_root.mkdir(mode=0o700)
-    unavailable_reserve = shutil.disk_usage(free_root).free + 1
+    # Leave enough margin for filesystem accounting to move between the
+    # preflight measurement and the capacity check.
+    unavailable_reserve = shutil.disk_usage(free_root).free + (1 << 30)
     free_limited = _make_store(free_root, capacity=CapacityPolicy(min_free_bytes=unavailable_reserve))
     free_result = free_limited.get_or_build(
         BuildRequest(identity),
