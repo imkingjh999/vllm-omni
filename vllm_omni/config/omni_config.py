@@ -1872,9 +1872,24 @@ class VllmOmniConfig:
             for topology in pipeline_cfg.stages
         )
 
+        orch_overrides = _orchestrator_cli_overrides(cli_overrides)
+        # MiniCPM-o 4.5 on NPU: fresh-boot weight-load drift (observed
+        # 151-424 s for stage0 alone) makes the stock 300/600 s orchestrator
+        # timeouts tight; raise them for that pipeline only, with explicit
+        # CLI overrides still winning.
+        if getattr(deploy, "pipeline", None) == "minicpmo_4_5":
+            try:
+                import torch
+
+                _npu = getattr(torch, "npu", None) is not None and torch.npu.is_available()
+            except Exception:
+                _npu = False
+            if _npu:
+                orch_overrides.setdefault("stage_init_timeout", 600)
+                orch_overrides.setdefault("init_timeout", 1200)
         orchestrator_config = cast(Any, VllmOmniOrchestratorConfig)(
             deploy_config_path=loaded_deploy_config_path,
-            **_orchestrator_cli_overrides(cli_overrides),
+            **orch_overrides,
         )
         return cast(Any, cls)(
             pipeline_config=pipeline_cfg,

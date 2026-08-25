@@ -1137,6 +1137,94 @@ async def omni_init_app_state(
     # real user request is fast instead of paying a 100s compilation tax.
     await state.openai_serving_speech.warmup()
 
+    # MiniCPM-o 4.5 chat-TTS warmup: the first stage2 request triggers the
+    # in-process TBE knowledge-bank init (~14 s) and the first bs=4 decode
+    # batch triggers per-batch-width op compilation (~35 s). Pay both costs
+    # here at startup - one request first, then an 8-way burst so stage2
+    # sustains full batches - instead of on the first user requests. The
+    # request mirrors the seed-tts bench payload (system prompt + inline
+    # ref_audio voice-clone fields); a bare-text request takes a different
+    # stage2 prompt path and is NOT representative.
+    def _engine_arch(stage: Any) -> Any:
+        engine_args = stage.get("engine_args") if hasattr(stage, "get") else getattr(stage, "engine_args", None)
+        if engine_args is None:
+            return None
+        return engine_args.get("model_arch") if hasattr(engine_args, "get") else getattr(engine_args, "model_arch", None)
+
+    _mcpmo45_stage = any(
+        _engine_arch(stage) == "MiniCPMO45OmniForConditionalGeneration"
+        for stage in (getattr(engine_client, "stage_configs", []) or [])
+    )
+    try:
+        import torch
+
+        _is_npu = getattr(torch, "npu", None) is not None and torch.npu.is_available()
+    except Exception:
+        _is_npu = False
+    if state.openai_serving_chat is not None and _mcpmo45_stage and _is_npu:
+        # Scoped to the MiniCPM-o 4.5 omni pipeline on NPU: the warmup
+        # pre-pays NPU-only costs (stage2 TBE knowledge-bank init, per
+        # batch-width op compilation) and must not fire on CUDA serves or
+        # name-similar models (e.g. MiniCPM-V).
+        import base64 as _b64
+        import os as _os
+        from pathlib import Path as _Path
+
+        started = time.perf_counter()
+        warm_ref_audio = None
+        warm_ref_text = ""
+        for _wav, _txt in (
+            (_Path(_os.environ.get("MINICPMO_WARMUP_WAV", "/workspace/user_data/seed-tts-eval/zh/prompt-wavs/10002287-00000094.wav")), "在此奉劝大家别乱打美白针。"),
+            (_Path(args.model) / "assets" / "HT_ref_audio.wav", "The quick brown fox jumps over the lazy dog."),
+        ):
+            try:
+                if _wav.is_file():
+                    warm_ref_audio = "data:audio/wav;base64," + _b64.b64encode(_wav.read_bytes()).decode("ascii")
+                    warm_ref_text = _txt
+                    break
+            except Exception:
+                pass
+
+        async def _warm_one() -> None:
+            warm_request = ChatCompletionRequest(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": [{
+                            "type": "text",
+                            "text": (
+                                "You are a text-to-speech engine with zero-shot voice cloning: "
+                                "the API provides reference audio and its transcript (ref_audio, ref_text) "
+                                "and task_type Base. The user message is the exact text you must speak."
+                            ),
+                        }],
+                    },
+                    {"role": "user", "content": [{"type": "text", "text": "你好，这是一段启动预热文本，用来预热语音合成流水线。"}]},
+                ],
+                temperature=0.0,
+                max_tokens=512,
+                chat_template_kwargs={"enable_thinking": False, "use_tts_template": True},
+            )
+            warm_request.modalities = ["text", "audio"]
+            if warm_ref_audio is not None:
+                warm_request.ref_audio = warm_ref_audio
+                warm_request.ref_text = warm_ref_text
+                warm_request.task_type = "Base"
+                warm_request.language = "Chinese" if warm_ref_text.startswith("在") else "English"
+            await state.openai_serving_chat.create_chat_completion(warm_request)
+
+        try:
+            await _warm_one()
+            await asyncio.gather(*(_warm_one() for _ in range(8)))
+            logger.info("MiniCPM-o chat-TTS warmup finished in %.1f s.", time.perf_counter() - started)
+        except Exception as exc:
+            # A failed warmup means the first real request pays the cold
+            # costs (or the pipeline is broken); surface it on /health
+            # instead of reporting a healthy serve.
+            logger.error("MiniCPM-o chat-TTS warmup FAILED: %s", exc)
+            state.minicpmo_chat_tts_warmup_failed = True
+
     state.openai_serving_audio_generate = OmniOpenAIServingAudioGenerate(
         engine_client, state.openai_serving_models, request_logger=request_logger, model_name=model_name
     )
@@ -1781,12 +1869,17 @@ async def health(raw_request: Request) -> JSONResponse:
 
     try:
         await engine_client.check_health()
-        return JSONResponse(content={"status": "healthy"})
     except EngineDeadError:
         return JSONResponse(
             content={"status": "unhealthy"},
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
         )
+    if getattr(raw_request.app.state, "minicpmo_chat_tts_warmup_failed", False):
+        return JSONResponse(
+            content={"status": "unhealthy", "reason": "MiniCPM-o chat-TTS warmup failed"},
+            status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
+        )
+    return JSONResponse(content={"status": "healthy"})
 
 
 # Remove existing models endpoint if present (from vllm imports)
