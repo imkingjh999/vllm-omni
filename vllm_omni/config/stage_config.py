@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Stage configuration system for vLLM-Omni."""
 
 from __future__ import annotations
@@ -384,6 +384,7 @@ class StageDeployConfig:
     enable_distributed_layerwise_offload: bool | None = None
     dlo_use_allgather: bool | None = None
     dlo_resident_layers: int | None = None
+    dlo_offload_components: dict[str, bool] | None = None
     # Diffusion-specific debug and observability knobs.
     enable_diffusion_pipeline_profiler: bool | None = None
 

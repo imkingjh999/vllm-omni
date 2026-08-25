@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Omni serve command for vLLM-Omni.
 
@@ -728,6 +731,18 @@ class OmniServeCommand(CLISubcommand):
             default=0,
             help="Keep this many leading main-DiT blocks resident on the device "
             "while distributed layerwise offload streams the remaining blocks.",
+        )
+        omni_config_group.add_argument(
+            "--dlo-offload-components",
+            type=json.loads,
+            default=None,
+            metavar="JSON",
+            help=(
+                "Per auxiliary encoder/VAE DLO policy as a JSON object, for example "
+                "'{\"text_encoder\": false}'. False keeps the whole component "
+                "resident; true permits the model's existing offload behavior. "
+                "DiT offload is not controlled by this map."
+            ),
         )
         # Video model parameters (e.g., Wan2.2) - engine-level
         omni_config_group.add_argument(

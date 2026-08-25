@@ -20,7 +20,7 @@ implemented but has less end-to-end coverage than the primary path.
 Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsupported.
 
 | Feature | DLO + AllGather | DLO without AllGather |
-|---|---|---|
+| --- | --- | --- |
 | **DP** | ✅ Primary path; host weights are sharded across the DP group. | ✅ Each DP rank streams complete rank-local blocks. |
 | **SP** | ✅ When DP=1, DLO uses the SP group for weight sharding. | ✅ SP remains active without a DLO weight collective. |
 | **TP > 1** | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. | ⚠️ Ordinary TP-aware loader only; no direct checkpoint mmap. |
@@ -29,6 +29,7 @@ Legend: ✅ supported, ⚠️ compatibility path or limited validation, ❌ unsu
 | **Other online quantization methods** | ❌ Rejected until runtime packing and scale layouts are validated. | ⚠️ Allowed through the ordinary loader; validation is method-specific. |
 | **Model-level or standard layerwise CPU offload** | ❌ Disabled because DLO takes priority. | ❌ Disabled because DLO takes priority. |
 | **Resident leading layers** | ❌ Rejected. | ✅ Requires eligible resident paths in the model's `OffloadPlan`. |
+| **Auxiliary component policy** | ✅ Encoders/VAEs may remain resident. | ✅ Encoders/VAEs may remain resident. |
 
 See [Parallelism compatibility](#parallelism-compatibility) and
 [Request and loading constraints](#request-and-loading-constraints) for the
@@ -172,7 +173,7 @@ This mode means:
 ## Parallelism compatibility
 
 | Parallelism | DLO + AllGather | DLO without AllGather |
-|---|---|---|
+| --- | --- | --- |
 | **DP** | Supported primary path. DLO shards host weights across the DP group and can run DP multi-concurrency. | Supported rank-local path. Compatible TP1 replicas can share checkpoint pages on each node; fallback runtime tensors remain private. |
 | **SP** | Supported in the implementation. With DP=1, DLO uses the SP group for host-weight sharding; SP still shards sequence/activation work. | SP remains active, but DLO keeps standard-loader rank-local weights and adds no SP weight collective. |
 | **TP > 1** | Outside the Phase A shared-mmap support scope. The loader falls back before mutation, preserves TP-local layouts, and DLO may apply DP/SP host sharding to those ordinary runtime tensors. | Outside the Phase A shared-mmap support scope. The ordinary TP-aware loader produces rank-local tensors, which DLO streams without an additional weight collective; DP replicas retain private runtime storage. |
@@ -192,6 +193,22 @@ This mode means:
 - **HSDP + DP or TP:** rejected independently by the diffusion parallel
   configuration.
 
+### Auxiliary component policy
+
+`dlo_offload_components` maps discovered encoder/VAE paths to booleans. A
+component set to `False` is materialized on the target device once and is not
+entered through the model's manual offload lifecycle. A `True` value permits
+the existing `OffloadPlan.on_demand_component_paths` and encoder block-hook
+behavior; it does not add support where the model declares none. The optional
+`default` key handles unmatched auxiliary components, and an empty map
+preserves the current policy.
+
+The policy is resolved after component discovery and before DLO mutates DiT
+storage. Unknown names, including DiT paths, are rejected. DLO continues to
+own DiT streaming regardless of this map, which avoids an invalid state where
+the loader has skipped ordinary DiT materialization but the backend is asked
+to keep that DiT resident.
+
 ## Request and loading constraints
 
 AllGather DP multi-concurrency requires:
@@ -202,6 +219,15 @@ AllGather DP multi-concurrency requires:
 
 The no-AllGather path does not impose these DLO-specific synchronized-wave
 requirements.
+
+MiniMax-H3 currently builds one global encoder TP group and broadcasts the
+resulting conditioning from global rank 0. Therefore an encoder TP group that
+spans multiple DP replicas is not valid for independent-prompt AllGather
+waves. Exact-recipe DP2/TP2 and DP2/SP2 experiments with encoder TP4 completed
+the collective schedule, but two distinct prompts with the same seed produced
+byte-identical video and audio in every measured wave. Enabling or disabling
+encoder offload produced paired-identical results, so this is a pre-existing
+model topology limitation rather than component-policy behavior.
 
 Direct checkpoint mmap can back either transfer path. It is currently limited
 to proven TP1, non-HSDP, non-online-quantized layouts. Other layouts use the
@@ -243,7 +269,7 @@ VAEs at TP1. They validate the ordinary-loader fallback only, not direct mmap
 or shared-mmap host-memory savings.
 
 | Configuration | Result | Warm E2E | Peak device memory | Host PSS |
-|---|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: |
 | DP4xTP1 AllGather | Passed, 4 concurrent requests | 2.87 s / 4 requests | 13.84 GiB | 211.99 GiB |
 | DP4xTP1 no-AllGather | Passed, 1 request | 15.02 s | 13.23 GiB | 187.77 GiB |
 | DP2xTP2 AllGather | Passed, 2 concurrent requests | 4.16 s / 2 requests | 12.50 GiB | 211.97 GiB |
@@ -258,6 +284,9 @@ ordinary loader as designed; no-AllGather PSS was 314.01 GiB, about 48% above
 AllGather, because DP replicas did not share checkpoint-backed runtime
 weights. This is a functional and memory smoke test, not a production-quality
 performance or output-quality benchmark.
+
+These B300 DP waves intentionally reused the same prompt and seed, so they do
+not establish independent-prompt isolation across DP replicas.
 
 ### Host-memory measurement
 
@@ -275,7 +304,7 @@ pipeline components, so each worker should be compared with the same worker in
 the other storage mode.
 
 | Worker | Ordinary RSS | mmap RSS | Ordinary PSS | mmap PSS | PSS reduction |
-|---|---:|---:|---:|---:|---:|
+| --- | ---: | ---: | ---: | ---: | ---: |
 | DP worker 0 | 168.27 GiB | 132.76 GiB | 167.84 GiB | 101.43 GiB | 66.40 GiB |
 | DP worker 1 | 116.19 GiB | 79.97 GiB | 115.73 GiB | 48.64 GiB | 67.09 GiB |
 | **Two-worker total** | — | — | **283.56 GiB** | **150.08 GiB** | **133.48 GiB (47.1%)** |
