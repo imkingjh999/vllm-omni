@@ -187,6 +187,7 @@ class OmniRequestState(RequestState):
                 finish_reason,
                 stop_reason,
                 kv_transfer_params,
+                ec_transfer_params,
             )
 
         is_delta = self.output_kind == RequestOutputKind.DELTA
@@ -240,6 +241,7 @@ class OmniRequestState(RequestState):
             outputs,
             finished,
             kv_transfer_params,
+            ec_transfer_params,
         )
 
     def _new_completion_output(
@@ -319,6 +321,7 @@ class OmniRequestState(RequestState):
         outputs: list,
         finished: bool,
         kv_transfer_params: dict[str, Any] | None = None,
+        ec_transfer_params: dict[str, Any] | None = None,
     ) -> RequestOutput | PoolingRequestOutput:
         """Create request output, handling no-detokenizer generation stages.
 
@@ -333,6 +336,7 @@ class OmniRequestState(RequestState):
                 outputs,
                 finished,
                 kv_transfer_params,
+                ec_transfer_params,
             )
 
         # No-detokenizer path: build RequestOutput directly.
@@ -351,6 +355,7 @@ class OmniRequestState(RequestState):
             outputs=outputs,
             finished=finished,
             kv_transfer_params=kv_transfer_params,
+            ec_transfer_params=ec_transfer_params,
             num_cached_tokens=self.num_cached_tokens,
             metrics=self.stats,
         )

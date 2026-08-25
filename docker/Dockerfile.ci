@@ -1,7 +1,9 @@
-# Target vllm version: v0.27.0 @ e50f7d369609, installed on top of the v0.27.0
-# base image via the precompiled wheel pinned below. Pin and base image name the
-# same release today, so the reinstall is a no-op; the block exists so the pin
-# can advance to an untagged commit without re-deriving all of this by hand.
+# Target vllm version: v0.28.0 final @ 2cf0a6915ce5, installed on top of the
+# v0.27.0 base image via the precompiled wheel pinned below. The pin lands on
+# the v0.28.0 release tag while the base image stays one release behind (no
+# v0.28.0 base image consumed here yet): the wheel decides the vLLM, the base
+# image only supplies the CUDA userland, and torch/flashinfer/numpy are
+# re-pinned below from the wheel commit's requirements.
 #
 # Pinned form: VLLM_PRECOMPILED_WHEEL_COMMIT is the rebase baseline — the rebase
 # agent reads it (agent/tasks/20_update_wheel_url.sh) and advances it on each

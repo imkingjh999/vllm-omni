@@ -663,3 +663,23 @@ def test_mm_only_outputs_update_iteration_stats():
     assert finished.finish_reason == FinishReason.STOP
     assert finished.num_prompt_tokens == state.prompt_len
     assert finished.num_generation_tokens == 2
+
+
+def test_ec_transfer_params_survive_both_construction_paths():
+    """v0.28 contract: encoder-cache transfer metadata must reach
+    RequestOutput.ec_transfer_params through BOTH omni construction paths —
+    the upstream-delegating one (logprobs processor present) and the
+    no-detokenizer generation-stage one (direct RequestOutput build).
+    Regression: the override accepted the argument but dropped it."""
+    ec = {"remote_handle": "enc-cache-1"}
+
+    state = _make_state(RequestOutputKind.CUMULATIVE)
+    out = state.make_request_output([1], None, None, None, {"kv": 1}, ec)
+    assert out is not None and out.ec_transfer_params == ec
+
+    kwargs = dict(_DEFAULT_STATE_KWARGS)
+    kwargs.update(logprobs_processor=None, detokenizer=None)
+    gen_state = OmniRequestState(**kwargs, output_kind=RequestOutputKind.CUMULATIVE)
+    completion = gen_state._new_completion_output([1], None, None)
+    direct = gen_state._new_request_output("r", [completion], False, {"kv": 1}, ec)
+    assert direct.ec_transfer_params == ec
