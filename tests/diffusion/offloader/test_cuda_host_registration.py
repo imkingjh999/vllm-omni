@@ -12,13 +12,12 @@ import torch
 import vllm_omni.diffusion.offloader.cuda_host_registration as registration_module
 from vllm_omni.diffusion.offloader.cuda_host_registration import (
     CudaHostRegistration,
-    CudaHostRegistrationBudgetError,
-    CudaHostRegistrationCleanupError,
-    CudaHostRegistrationError,
     _coalesce_ranges,
     _mapped_regions,
 )
 from vllm_omni.diffusion.offloader.host_registration import (
+    HostRegistrationBudgetError,
+    HostRegistrationCleanupError,
     HostRegistrationError,
     register_host_mappings,
 )
@@ -118,9 +117,9 @@ def test_registration_rejects_writable_or_over_budget_before_cuda(monkeypatch: p
     runtime = _FakeRuntime([0])
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
 
-    with pytest.raises(CudaHostRegistrationError, match="is writable"):
+    with pytest.raises(HostRegistrationError, match="is writable"):
         CudaHostRegistration.create((_region("weights", 0x1000, 1, read_only=False),), max_bytes=None)
-    with pytest.raises(CudaHostRegistrationBudgetError, match="exceeding"):
+    with pytest.raises(HostRegistrationBudgetError, match="exceeding"):
         CudaHostRegistration.create((_region("weights", 0x1003, 4096),), max_bytes=4096)
     assert runtime.registered == []
 
@@ -129,7 +128,7 @@ def test_registration_requires_read_only_capability(monkeypatch: pytest.MonkeyPa
     runtime = _FakeRuntime([0], read_only_supported=False)
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
 
-    with pytest.raises(CudaHostRegistrationError, match="does not support read-only"):
+    with pytest.raises(HostRegistrationError, match="does not support read-only"):
         CudaHostRegistration.create((_region("weights", 0x1000, 4096),), max_bytes=None)
     assert runtime.attribute_queries == [
         (registration_module._CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED, 0)
@@ -143,7 +142,7 @@ def test_capability_error_is_consumed_before_fallback(monkeypatch: pytest.Monkey
     consumed: list[int] = []
     monkeypatch.setattr(registration_module, "_consume_last_cuda_error", consumed.append)
 
-    with pytest.raises(CudaHostRegistrationError, match="error-7"):
+    with pytest.raises(HostRegistrationError, match="error-7"):
         CudaHostRegistration.create((_region("weights", 0x1000, 4096),), max_bytes=None)
     assert consumed == [7]
 
@@ -153,7 +152,7 @@ def test_partial_registration_rolls_back(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
     monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _error: None)
 
-    with pytest.raises(CudaHostRegistrationError, match="error-7"):
+    with pytest.raises(HostRegistrationError, match="error-7"):
         CudaHostRegistration.create(
             (
                 _region("first", 0x1000, 4096),
@@ -169,7 +168,7 @@ def test_failed_rollback_exposes_active_registration_for_retry(monkeypatch: pyte
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
     monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _error: None)
 
-    with pytest.raises(CudaHostRegistrationCleanupError, match="rollback errors") as error:
+    with pytest.raises(HostRegistrationCleanupError, match="rollback errors") as error:
         CudaHostRegistration.create(
             (
                 _region("first", 0x1000, 4096),

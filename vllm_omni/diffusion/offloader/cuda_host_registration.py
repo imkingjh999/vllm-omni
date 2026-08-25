@@ -24,10 +24,6 @@ from .host_registration import (
 _CUDA_HOST_REGISTER_READ_ONLY = 0x08
 _CUDA_DEVICE_ATTRIBUTE_HOST_REGISTER_READ_ONLY_SUPPORTED = 113
 
-CudaHostRegistrationError = HostRegistrationError
-CudaHostRegistrationBudgetError = HostRegistrationBudgetError
-CudaHostRegistrationCleanupError = HostRegistrationCleanupError
-
 
 class _CudaRuntime(Protocol):
     def cudaHostRegister(self, address: int, size: int, flags: int) -> int: ...
