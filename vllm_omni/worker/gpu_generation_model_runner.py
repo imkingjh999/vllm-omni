@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Code2Wav GPU Model Runner for vLLM-Omni.
 
 Handles direct conversion from codec codes to audio waveforms for Qwen3 Omni MoE Code2Wav.

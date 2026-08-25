@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Unit tests for AsyncOmniEngine single-stage mode and OmniMasterServer."""
 
 from __future__ import annotations

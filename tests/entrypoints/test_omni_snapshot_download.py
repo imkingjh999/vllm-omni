@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """``omni_snapshot_download`` must honor vLLM's ``VLLM_USE_MODELSCOPE`` semantics.
 
 vLLM treats the flag as enabled for the literal strings ``"1"`` or ``"true"``
