@@ -139,18 +139,22 @@ def test_registration_requires_read_only_capability(monkeypatch: pytest.MonkeyPa
 def test_capability_error_is_consumed_before_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = _FakeRuntime([0], attribute_result=7)
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
-    consumed: list[int] = []
-    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", consumed.append)
+    consumed: list[tuple[object, int]] = []
+    monkeypatch.setattr(
+        registration_module,
+        "_consume_last_cuda_error",
+        lambda actual_runtime, error: consumed.append((actual_runtime, error)),
+    )
 
     with pytest.raises(HostRegistrationError, match="error-7"):
         CudaHostRegistration.create((_region("weights", 0x1000, 4096),), max_bytes=None)
-    assert consumed == [7]
+    assert consumed == [(runtime, 7)]
 
 
 def test_partial_registration_rolls_back(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = _FakeRuntime([0, 7])
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
-    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _error: None)
+    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _runtime, _error: None)
 
     with pytest.raises(HostRegistrationError, match="error-7"):
         CudaHostRegistration.create(
@@ -166,7 +170,7 @@ def test_partial_registration_rolls_back(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_failed_rollback_exposes_active_registration_for_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = _FakeRuntime([0, 7], unregister_results=[9, 0])
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
-    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _error: None)
+    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _runtime, _error: None)
 
     with pytest.raises(HostRegistrationCleanupError, match="rollback errors") as error:
         CudaHostRegistration.create(
@@ -185,7 +189,7 @@ def test_failed_rollback_exposes_active_registration_for_retry(monkeypatch: pyte
 def test_successful_registration_retries_failed_close(monkeypatch: pytest.MonkeyPatch) -> None:
     runtime = _FakeRuntime([0], unregister_results=[9, 0])
     monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
-    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _error: None)
+    monkeypatch.setattr(registration_module, "_consume_last_cuda_error", lambda _runtime, _error: None)
     registration = CudaHostRegistration.create((_region("weights", 0x1003, 1),), max_bytes=None)
 
     assert registration.total_bytes == 4096
@@ -201,6 +205,46 @@ def test_consume_last_cuda_error_accepts_cleared_or_matching_state(
     pending_error: int,
 ) -> None:
     runtime = SimpleNamespace(cudaGetLastError=lambda: pending_error)
-    monkeypatch.setattr(registration_module.ctypes, "CDLL", lambda _name: runtime)
+    monkeypatch.setattr(
+        registration_module.ctypes,
+        "CDLL",
+        lambda _name: pytest.fail("the cudart handle should provide cudaGetLastError"),
+    )
 
-    registration_module._consume_last_cuda_error(801)
+    registration_module._consume_last_cuda_error(runtime, 801)
+
+
+def test_consume_last_cuda_error_falls_back_to_global_symbol(monkeypatch: pytest.MonkeyPatch) -> None:
+    global_runtime = SimpleNamespace(cudaGetLastError=lambda: 801)
+    monkeypatch.setattr(registration_module.ctypes, "CDLL", lambda _name: global_runtime)
+
+    registration_module._consume_last_cuda_error(SimpleNamespace(), 801)
+
+
+def test_clean_rollback_remains_recoverable_when_error_state_cannot_be_cleared(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = _FakeRuntime([0, 7])
+    monkeypatch.setattr(runtime, "cudaGetLastError", None, raising=False)
+    monkeypatch.setattr(registration_module.torch.cuda, "cudart", lambda: runtime)
+
+    def missing_global_symbol(_name: object) -> None:
+        raise OSError("cudart symbols are local")
+
+    monkeypatch.setattr(
+        registration_module.ctypes,
+        "CDLL",
+        missing_global_symbol,
+    )
+
+    with pytest.raises(HostRegistrationError, match="cannot clear") as error:
+        CudaHostRegistration.create(
+            (
+                _region("first", 0x1000, 4096),
+                _region("second", 0x9000, 4096),
+            ),
+            max_bytes=None,
+        )
+
+    assert not isinstance(error.value, HostRegistrationCleanupError)
+    assert runtime.unregistered == [0x1000]

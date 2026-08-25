@@ -5,6 +5,7 @@
 
 import gc
 import json
+import weakref
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -807,6 +808,7 @@ def test_registered_mmap_resident_group_bypasses_host_staging(patched_offload_ru
 
 
 def test_hwr_registration_uses_transport_budget(monkeypatch: pytest.MonkeyPatch):
+    dist_backend_module._ACTIVE_HWR_REGISTRATIONS.clear()
     plan, _, lease = _fake_hwr_plan()
     backend = DistributedLayerwiseOffloadBackend(
         OffloadConfig(
@@ -840,6 +842,11 @@ def test_hwr_registration_uses_transport_budget(monkeypatch: pytest.MonkeyPatch)
 
     assert backend._try_register_hwr_mmap((pinned_source,))  # type: ignore[arg-type]
     assert calls == [(lease.mapped_regions, int(1.5 * 1024**3))]
+    assert dist_backend_module._ACTIVE_HWR_REGISTRATIONS == [(backend._host_registration, lease)]
+
+    backend._release_registered_mmap()
+
+    assert dist_backend_module._ACTIVE_HWR_REGISTRATIONS == []
 
 
 def test_hwr_registration_budget_validation_is_transport_scoped():
@@ -868,6 +875,7 @@ def test_unregistration_precedes_lease_close_and_retries_failures(
     monkeypatch: pytest.MonkeyPatch,
     patched_offload_runtime,
 ):
+    dist_backend_module._ACTIVE_HWR_REGISTRATIONS.clear()
     events: list[str] = []
     responses = iter([("busy",), ()])
 
@@ -898,12 +906,60 @@ def test_unregistration_precedes_lease_close_and_retries_failures(
         backend.disable()
     assert not lease.closed
     assert backend._host_registration is not None
+    assert dist_backend_module._ACTIVE_HWR_REGISTRATIONS == [(backend._host_registration, lease)]
 
     backend.disable()
 
     assert lease.closed
     assert backend._host_registration is None
+    assert dist_backend_module._ACTIVE_HWR_REGISTRATIONS == []
     assert events == ["unregister", "unregister", "lease"]
+
+
+def test_failed_unregistration_retains_lease_after_backend_is_dropped(
+    monkeypatch: pytest.MonkeyPatch,
+    patched_offload_runtime,
+):
+    events: list[str] = []
+
+    class Registration:
+        @staticmethod
+        def close() -> tuple[str, ...]:
+            events.append("unregister")
+            return ("busy",)
+
+    dist_backend_module._ACTIVE_HWR_REGISTRATIONS.clear()
+    backend = DistributedLayerwiseOffloadBackend(
+        OffloadConfig(
+            strategy=OffloadStrategy.DISTRIBUTED_LAYER_WISE,
+            pin_cpu_memory=True,
+            dp_size=1,
+            dlo_use_allgather=False,
+        ),
+        torch.device("cpu"),
+    )
+    lease = _FakeHostWeightLease("retained", events)
+    registration = Registration()
+    backend._host_weight_lease = lease  # type: ignore[assignment]
+    backend._host_registration = registration
+    backend._using_rank_local_mmap = True
+    backend.enabled = True
+    monkeypatch.setattr(current_omni_platform, "synchronize", lambda: None)
+    lease_ref = weakref.ref(lease)
+
+    with pytest.raises(HostRegistrationCleanupError, match="failed to unregister"):
+        backend.disable()
+    del backend
+    del lease
+    gc.collect()
+
+    retained_lease = dist_backend_module._ACTIVE_HWR_REGISTRATIONS[0][1]
+    assert dist_backend_module._ACTIVE_HWR_REGISTRATIONS == [(registration, retained_lease)]
+    assert lease_ref() is retained_lease
+    assert not retained_lease.closed
+
+    dist_backend_module._ACTIVE_HWR_REGISTRATIONS.clear()
+    retained_lease.close()
 
 
 class _MultiBlockModel(nn.Module):

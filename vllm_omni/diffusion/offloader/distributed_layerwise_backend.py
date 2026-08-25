@@ -18,6 +18,7 @@ This module implements the RFC-1 "Distributed Layerwise Offload" mechanism that:
 
 from __future__ import annotations
 
+import threading
 import time
 from itertools import chain
 from typing import Any
@@ -57,6 +58,38 @@ from .tensor_utils import (
 )
 
 logger = init_logger(__name__)
+
+# A backend normally owns both objects below. This process-lifetime safety
+# owner prevents HostWeightLease.__del__ from unmapping storage when cleanup
+# failure unwinds startup and the backend itself becomes unreachable. A clean
+# retry removes the pair before closing the lease.
+_ACTIVE_HWR_REGISTRATIONS: list[tuple[HostRegistration, HostWeightLease]] = []
+_ACTIVE_HWR_REGISTRATIONS_LOCK = threading.Lock()
+
+
+def _retain_active_hwr_registration(
+    registration: HostRegistration,
+    lease: HostWeightLease,
+) -> None:
+    with _ACTIVE_HWR_REGISTRATIONS_LOCK:
+        if not any(
+            candidate is registration and candidate_lease is lease
+            for candidate, candidate_lease in _ACTIVE_HWR_REGISTRATIONS
+        ):
+            _ACTIVE_HWR_REGISTRATIONS.append((registration, lease))
+
+
+def _forget_active_hwr_registration(
+    registration: HostRegistration,
+    lease: HostWeightLease,
+) -> None:
+    with _ACTIVE_HWR_REGISTRATIONS_LOCK:
+        _ACTIVE_HWR_REGISTRATIONS[:] = [
+            (candidate, candidate_lease)
+            for candidate, candidate_lease in _ACTIVE_HWR_REGISTRATIONS
+            if candidate is not registration or candidate_lease is not lease
+        ]
+
 
 # Threshold (in MB) for deciding whether a non-block DiT submodule should
 # use layerwise offload (streaming hooks) or be moved to GPU as a resident
@@ -1030,6 +1063,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 errors = registration.close()
                 if errors:
                     self._host_registration = registration
+                    _retain_active_hwr_registration(registration, lease)
                     raise HostRegistrationCleanupError(
                         "CUDA registration succeeded but pinned-source verification failed, "
                         f"and rollback failed: {errors[:3]}"
@@ -1039,6 +1073,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
                 errors = registration.close()
                 if errors:
                     self._host_registration = registration
+                    _retain_active_hwr_registration(registration, lease)
                     raise HostRegistrationCleanupError(
                         "CUDA registration succeeded but PyTorch rejected mapped sources, "
                         f"and rollback failed: {errors[:3]}"
@@ -1053,6 +1088,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             active_registration = exc.active_registration
             if active_registration is not None:
                 self._host_registration = active_registration
+                _retain_active_hwr_registration(active_registration, lease)
             logger.exception("HWR mmap registration rollback failed")
             raise
         except HostRegistrationError as exc:
@@ -1060,6 +1096,7 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             return False
 
         self._host_registration = registration
+        _retain_active_hwr_registration(registration, lease)
         logger.info(
             "Registered %.2f GiB of HWR mmap in %d range(s) for direct H2D in %.3f s",
             registration.total_bytes / 1024**3,
@@ -1095,8 +1132,14 @@ class DistributedLayerwiseOffloadBackend(OffloadBackend):
             return
         errors = registration.close()
         if errors:
+            lease = self._host_weight_lease
+            if lease is not None and not lease.closed:
+                _retain_active_hwr_registration(registration, lease)
             logger.error("HWR mmap unregistration failed; retaining lease mappings for retry: %s", errors[:3])
             raise HostRegistrationCleanupError(f"failed to unregister {len(errors)} HWR mmap range(s)")
+        lease = self._host_weight_lease
+        if lease is not None:
+            _forget_active_hwr_registration(registration, lease)
         self._host_registration = None
         logger.info("Unregistered HWR mmap ranges")
 

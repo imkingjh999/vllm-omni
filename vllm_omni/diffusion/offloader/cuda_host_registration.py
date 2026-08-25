@@ -32,6 +32,8 @@ class _CudaRuntime(Protocol):
 
     def cudaGetErrorString(self, error: int) -> str | bytes: ...
 
+    def cudaGetLastError(self) -> int: ...
+
 
 @dataclass(frozen=True)
 class _AddressRange:
@@ -94,18 +96,20 @@ def _error_message(runtime: _CudaRuntime, error: int) -> str:
     return str(message)
 
 
-def _consume_last_cuda_error(expected_error: int) -> None:
+def _consume_last_cuda_error(runtime: _CudaRuntime, expected_error: int) -> None:
     """Clear one handled CUDA Runtime error before returning to PyTorch."""
     try:
-        get_last_error = ctypes.CDLL(None).cudaGetLastError
-        get_last_error.argtypes = []
-        get_last_error.restype = ctypes.c_int
+        get_last_error = getattr(runtime, "cudaGetLastError", None)
+        if get_last_error is None:
+            get_last_error = ctypes.CDLL(None).cudaGetLastError
+            get_last_error.argtypes = []
+            get_last_error.restype = ctypes.c_int
         pending_error = int(get_last_error())
-    except (AttributeError, OSError) as exc:
-        raise HostRegistrationCleanupError("cannot clear CUDA's pending error after host-registration failure") from exc
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise HostRegistrationError("cannot clear CUDA's pending error after host-registration failure") from exc
 
     if pending_error not in (0, expected_error):
-        raise HostRegistrationCleanupError(
+        raise HostRegistrationError(
             f"host registration returned CUDA error {expected_error}, but cudaGetLastError reported {pending_error}"
         )
 
@@ -114,9 +118,9 @@ def _handled_error_message(runtime: _CudaRuntime, error: int) -> str:
     error_code = int(error)
     message = _error_message(runtime, error_code)
     try:
-        _consume_last_cuda_error(error_code)
-    except HostRegistrationCleanupError as exc:
-        raise HostRegistrationCleanupError(f"{message}; {exc}") from exc
+        _consume_last_cuda_error(runtime, error_code)
+    except HostRegistrationError as exc:
+        raise HostRegistrationError(f"{message}; {exc}") from exc
     return message
 
 
