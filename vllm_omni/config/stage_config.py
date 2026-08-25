@@ -662,9 +662,13 @@ def _apply_npu_perf_defaults(raw_dict: dict[str, Any]) -> dict[str, Any]:
     overrides make the tuned codec-chunking / token2wav / cudagraph settings
     take effect on NPU runtimes without requiring a deploy-config change.
     Operator-tuned YAML values win: only the stock untuned defaults
-    (``codec_chunk_frames: 25`` / ``cudagraph_mode: PIECEWISE``) are upgraded.
+    (``codec_chunk_frames: 25`` / ``cudagraph_mode: PIECEWISE``) are
+    upgraded, and an explicit ``npu_perf_defaults: false`` in the deploy
+    YAML disables the layer entirely.
     """
     if raw_dict.get("pipeline") != "minicpmo_4_5":
+        return raw_dict
+    if raw_dict.get("npu_perf_defaults") is False:
         return raw_dict
     try:
         import torch
@@ -704,7 +708,6 @@ def load_deploy_config(path: str | Path) -> DeployConfig:
             f"Deploy config {path} uses the removed `stage_args` schema; "
             "define topology in PipelineConfig and deployment overrides under `stages`."
         )
-    raw_dict = _apply_npu_perf_defaults(raw_dict)
 
     stages = [_parse_stage_deploy(s) for s in raw_dict.get("stages", [])]
 
