@@ -17,6 +17,7 @@ from typing import Any
 import torch
 import os
 
+import numpy as np
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import LlamaConfig
@@ -248,6 +249,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # MINICPMO_SAMP_CPU=0 (the CPU RNG stream differs from NPU at the
         # same seed, so WER/SIM re-run is required when toggling).
         self._samp_cpu = os.environ.get("MINICPMO_SAMP_CPU", "1") == "1"
+        # Pinned-logits fast path (E1): one blocking D2H per frame, then the
+        # whole warper chain in numpy (C speed, zero aten dispatch), one
+        # torch.multinomial for RNG parity. Opt out with MINICPMO_SAMP_FAST=0.
+        self._samp_fast = os.environ.get("MINICPMO_SAMP_FAST", "1") == "1"
+        self._samp_pin: torch.Tensor | None = None
+        self._stop_row_go: torch.Tensor | None = None
+        self._stop_row_stop: torch.Tensor | None = None
+        self._empty_delta: torch.Tensor | None = None
         self._request_generators_cpu: dict[str, torch.Generator] = {}
         self._request_audio_states: dict[str, dict[str, Any]] = {}
         self._deferred_cleanup_ids: set[str] = set()
@@ -331,6 +340,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         tts_hidden_states: torch.Tensor,
         *,
         native_duplex: bool = False,
+        audio_bos_only: bool = False,
     ) -> torch.Tensor:
         if tts_token_ids.numel() == 0 or tts_hidden_states.numel() == 0:
             # The thinker can legally emit an empty speech segment (<|tts_bos|>
@@ -354,8 +364,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             hidden_embeds = F.normalize(hidden_embeds, p=2, dim=-1)
         audio_bos = self.emb_text(torch.tensor([self._tts_bos_id], device=device, dtype=torch.long))
         condition = text_embeds + hidden_embeds
-        if native_duplex:
-            # Match MiniCPMTTS.generate_chunk's streaming condition.
+        if native_duplex or audio_bos_only:
+            # Match MiniCPMTTS.generate_chunk's streaming condition: a mid-reply
+            # streaming handoff ends with a bare <audio_bos> so generation
+            # continues into the next segment.
             return torch.cat([condition, audio_bos], dim=0)
         return torch.cat([condition, self._boundary_embeddings()], dim=0)
 
@@ -400,14 +412,16 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                     info_dict.get("request_id"),
                 )
             native_duplex = bool(info_dict.get("native_duplex", False))
+            meta = info_dict.get("meta")
+            audio_bos_only = isinstance(meta, dict) and meta.get("condition_suffix") == "audio_bos"
             full_embeds = self._build_condition_embeddings(
                 token_ids,
                 hidden_states,
                 native_duplex=native_duplex,
+                audio_bos_only=audio_bos_only,
             )
             offset = int(info_dict.get("_omni_num_computed_tokens", 0))
             request_id = str(info_dict.get("request_id", "0"))
-            meta = info_dict.get("meta")
             # The handoff rebuilds only the tail-aligned Talker condition.
             # Materialize zero-token embeddings for any scheduler prompt
             # prefix so chunked prefill can slice from a non-zero offset.
@@ -587,11 +601,87 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             generator=generator,
         ).reshape(())
 
+    def _sample_audio_code_fast(
+        self,
+        hidden_state: torch.Tensor,
+        codes_np: np.ndarray,
+        request_id: str,
+        step: int,
+    ) -> int:
+        """Pinned-D2H + numpy warper chain (E1 fast path).
+
+        Distribution-equivalent to ``_sample_codec_token``: repetition
+        penalty over the <=window recent ids, EOS mask below min_tokens,
+        top-k, then top-p measured against the full-vocab logsumexp. The
+        only per-frame device sync is the blocking pinned copy of the
+        logits row; the sampled id returns as a Python int (no H2D + no
+        ``.item()`` round-trip). RNG still draws through the per-request
+        CPU generator via torch.multinomial.
+        """
+        logits = self.head_code[0](hidden_state).float()
+        vocab_size = logits.shape[-1]
+        if self._samp_pin is None or self._samp_pin.shape[-1] != vocab_size:
+            self._samp_pin = torch.empty((1, vocab_size), dtype=torch.float32, pin_memory=True)
+        self._samp_pin.copy_(logits)
+        x = self._samp_pin.numpy()[0]
+
+        x = x / self._codec_temperature
+        penalty = self._codec_repetition_penalty
+        if penalty != 1.0 and codes_np.size:
+            uniq, counts = np.unique(codes_np[-_REPETITION_WINDOW:], return_counts=True)
+            hit = x[uniq]
+            alpha = np.power(penalty, counts.astype(np.float32))
+            x[uniq] = np.where(hit < 0.0, hit * alpha, hit / alpha)
+        min_tokens = self._codec_min_tokens
+        state = getattr(self, "_request_audio_states", {}).get(request_id)
+        if isinstance(state, dict):
+            min_tokens = int(state.get("min_tokens", min_tokens))
+        eos_id = self._num_audio_tokens - 1
+        if step < min_tokens:
+            x[eos_id] = -np.inf
+
+        keep = min(vocab_size, max(int(self._codec_top_k), 3))
+        idx = np.argpartition(-x, keep - 1)[:keep]
+        order = np.argsort(-x[idx], kind="stable")
+        idx = idx[order]
+        topv = x[idx]
+        m = float(x.max())
+        lse = m + float(np.log(np.exp(x - m).sum()))
+        probs = np.exp(topv - lse)
+        prefix_before = np.cumsum(probs) - probs
+        mask = prefix_before < float(self._codec_top_p)
+        mask[:3] = True
+        probs = np.where(mask, probs, 0.0).astype(np.float32)
+        probs_t = torch.from_numpy(probs)
+        j = int(torch.multinomial(probs_t / probs_t.sum(), 1, generator=self._request_generator_cpu(request_id)))
+        return int(idx[j])
+
     def make_omni_output(
         self,
         model_outputs: torch.Tensor | OmniOutput,
         **kwargs: Any,
     ) -> OmniOutput:
+        # PROBE_S1: frame cadence vs in-model wall (diagnostic only).
+        import time as _t
+
+        _p = self.__class__.__dict__.get("_probe_s1")
+        if _p is None:
+            _p = {"last_entry": 0.0, "n": 0, "sum_wall": 0.0, "sum_gap": 0.0}
+            setattr(self.__class__, "_probe_s1", _p)
+        _now = _t.perf_counter()
+        if _p["last_entry"]:
+            _p["sum_gap"] += _now - _p["last_entry"]
+            _p["n"] += 1
+        _p["last_entry"] = _now
+        if _p["n"] and _p["n"] % 250 == 0:
+            logger.warning(
+                "PROBE_S1 n=%d mean_gap=%.2fms mean_inmodel=%.2fms",
+                _p["n"],
+                1000.0 * _p["sum_gap"] / _p["n"],
+                1000.0 * _p["sum_wall"] / _p["n"],
+            )
+            _p["sum_gap"] = 0.0
+            _p["sum_wall"] = 0.0
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         hidden = model_outputs
@@ -616,7 +706,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         duplex_turn_ids: list[torch.Tensor] = []
         segment_texts_utf8: list[torch.Tensor] = []
         turn_end_flags: list[torch.Tensor] = []
-        empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+        # E1: cache the per-frame tiny tensors (fill launches) once per device.
+        if self._empty_delta is None or self._empty_delta.device != hidden.device:
+            self._empty_delta = hidden.new_empty((0, 1), dtype=torch.long)
+            self._stop_row_go = hidden.new_tensor([0.0, float("-inf")])
+            self._stop_row_stop = hidden.new_tensor([float("-inf"), 0.0])
+        empty_delta = self._empty_delta
+        stop_row_go = self._stop_row_go
+        stop_row_stop = self._stop_row_stop
         for index, info in enumerate(infos):
             info_dict = info if isinstance(info, dict) else {}
             native_duplex = info_dict.get("native_duplex") is True
@@ -662,14 +759,14 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 turn_end_flags.append(torch.tensor(native_duplex and contains_turn_eos, dtype=torch.bool))
 
             if not isinstance(info, dict):
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(stop_row_go)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
             start, end = spans[index]
             end = min(int(end), int(hidden.shape[0]))
             if int(start) >= end:
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(stop_row_go)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -683,7 +780,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 state = dict(info.get("audio_state", {}) or {})
                 request_states[request_id] = state
             if state.get("finished"):
-                stop_rows.append(hidden.new_tensor([float("-inf"), 0.0]))
+                stop_rows.append(stop_row_stop)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -691,7 +788,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 # vLLM computes a logit row for incomplete chunked prefills but
                 # discards its sampled token. Advancing codec/RNG state here
                 # would make output depend on prefill chunking and compaction.
-                stop_rows.append(hidden.new_tensor([0.0, float("-inf")]))
+                stop_rows.append(stop_row_go)
                 codec_deltas.append(empty_delta)
                 terminal_flags.append(torch.tensor(False, dtype=torch.bool))
                 continue
@@ -703,8 +800,17 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             else:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = int(state.get("step", 0))
-            sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
-            sampled_id = int(sampled.item())
+            if self._samp_cpu and self._samp_fast and hidden.device.type == "npu":
+                # E1 fast path: pinned D2H + numpy warper chain; the sampled
+                # id arrives as a Python int with no H2D/`.item()` round-trip.
+                codes_np = state.get("codes_np")
+                if not isinstance(codes_np, np.ndarray):
+                    codes_np = codes.detach().cpu().numpy().astype(np.int64)
+                    state["codes_np"] = codes_np
+                sampled_id = self._sample_audio_code_fast(hidden[end - 1 : end], codes_np, request_id, step)
+            else:
+                sampled = self._sample_audio_code(hidden[end - 1 : end], codes, request_id, step)
+                sampled_id = int(sampled.item())
             is_eos = sampled_id == self._num_audio_tokens - 1
             state["step"] = int(state.get("step", 0)) + 1
             reached_limit = int(state["step"]) >= int(state.get("max_tokens", 2048))
@@ -713,19 +819,23 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # MiniCPMTTS.generate_chunk consumes the boundary sample but
             # returns only codes that were fed into the retained KV state.
             if not is_eos and not reached_limit:
-                codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], sampled.reshape(1)])
-                delta = sampled.reshape(1, 1)
+                delta = torch.tensor([[sampled_id]], dtype=torch.long, device=hidden.device)
+                codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], delta.view(1)])
+                if isinstance(state.get("codes_np"), np.ndarray):
+                    state["codes_np"] = np.append(state["codes_np"][-(_REPETITION_WINDOW - 1) :], sampled_id)
+                current = delta.view(1)
             else:
                 delta = empty_delta
+                current = torch.tensor([sampled_id], dtype=torch.long, device=hidden.device)
             state["codes"] = codes
             info["audio_state"] = state
             info["audio_codes"] = {
-                "current": sampled.reshape(1),
+                "current": current,
                 "accumulated": codes,
             }
             codec_deltas.append(delta)
             terminal_flags.append(torch.tensor(finished, dtype=torch.bool))
-            stop_rows.append(hidden.new_tensor([float("-inf"), 0.0] if finished else [0.0, float("-inf")]))
+            stop_rows.append(stop_row_stop if finished else stop_row_go)
 
         self._batch_stop_logits = torch.stack(stop_rows, dim=0) if stop_rows else hidden.new_empty((0, 2))
         # Lists are deliberate: the runner routes element i to request i,
@@ -745,6 +855,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": meta_outputs,
         }
+        _p["sum_wall"] += _t.perf_counter() - _now
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,

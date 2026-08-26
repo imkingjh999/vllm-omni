@@ -650,11 +650,30 @@ class MiniCPMO45Code2Wav(nn.Module):
                 else:
                     states = [item.previous.token2wav for item in bucket if item.previous is not None]
                 tokens = torch.stack([item.tokens for item in bucket], dim=0)
+                import time as _t
+
+                _d0 = _t.perf_counter()
                 audios, next_states = self.backend.decode_batch(
                     tokens,
                     features,
                     states,
                     last_chunk=bucket[0].last_chunk,
+                )
+                _d1 = _t.perf_counter()
+                _pp = MiniCPMO45Code2Wav.__dict__.get("_probe_s2")
+                if _pp is None:
+                    _pp = {"last_end": 0.0, "n": 0, "sum_d": 0.0, "max_d": 0.0}
+                    setattr(MiniCPMO45Code2Wav, "_probe_s2", _pp)
+                _pp["n"] += 1
+                _pp["sum_d"] += _d1 - _d0
+                _pp["max_d"] = max(_pp["max_d"], _d1 - _d0)
+                gap2 = (_d0 - _pp["last_end"]) if _pp["last_end"] else float("nan")
+                _pp["last_end"] = _d1
+                logger.warning(
+                    "PROBE_S2 chunk#%d decode=%.1fms since_prev_start=%.1fms",
+                    _pp["n"],
+                    1000.0 * (_d1 - _d0),
+                    1000.0 * gap2,
                 )
             except Exception as exc:
                 self._prune_unowned_runtime_prompts()

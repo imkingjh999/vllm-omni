@@ -12,6 +12,7 @@ handled by :class:`MembershipController`, which is injected optionally.
 from __future__ import annotations
 
 import asyncio
+import os
 import time as _time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -1293,11 +1294,29 @@ class Orchestrator:
             )
             return
 
+        # Streaming text handoff (experimental, MINICPMO_STREAM_HANDOFF=1):
+        # forward non-finished stage-0 DELTA outputs to the next stage as
+        # incremental handoffs. llm2tts may still defer (empty next_inputs)
+        # until enough new text has accumulated.
+        stream_handoff = (
+            os.environ.get("MINICPMO_STREAM_HANDOFF", "0") == "1"
+            and stage_id == 0
+            and req_state.final_stage_id > 0
+            and not self._is_duplex_session_request(req_state)
+        )
         if (
-            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
+            (
+                finished
+                or (req_state.streaming.enabled and req_state.streaming.segment_finished)
+                or stream_handoff
+            )
             and stage_id < req_state.final_stage_id
             and (not self.async_chunk or not self._stage_receives_async_chunks(stage_id + 1))
-            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
+            and (
+                not self._next_stage_already_submitted(stage_id, req_state)
+                or req_state.streaming.enabled
+                or stream_handoff
+            )
         ):
             if (
                 finished
@@ -1318,16 +1337,19 @@ class Orchestrator:
                     output,
                     req_state,
                     src_replica_id=replica_id,
-                    is_streaming_session=req_state.streaming.enabled,
+                    is_streaming_session=(req_state.streaming.enabled or stream_handoff),
                     is_final_update=final_only_finished,
                 )
                 if (
-                    req_state.streaming.enabled
+                    (req_state.streaming.enabled or stream_handoff)
                     and finished
                     and not final_only_finished
                     and not self._is_duplex_session_request(req_state)
                 ):
-                    # For streaming sessions, send the terminal (resumable=False) update only on a finish
+                    # For streaming sessions, send the terminal (resumable=False) update only on a finish.
+                    # The final tokens ride the first (resumable) update above; a
+                    # non-resumable update maps to the scheduler's None finish
+                    # sentinel, which would silently drop them if sent alone.
                     await self._forward_to_next_stage(
                         req_id,
                         stage_id,

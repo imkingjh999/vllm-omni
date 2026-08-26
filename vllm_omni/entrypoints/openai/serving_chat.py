@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
@@ -239,7 +240,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
             model_stage = self._stage_get(engine_args, "model_stage")
             if model_stage == "llm":
-                sp.output_kind = RequestOutputKind.FINAL_ONLY
+                if os.environ.get("MINICPMO_STREAM_HANDOFF", "0") == "1":
+                    # Streaming handoff (experimental): stream thinker deltas so
+                    # llm2tts can extend the talker mid-flight instead of waiting
+                    # for the completed reply.
+                    sp.output_kind = RequestOutputKind.DELTA
+                else:
+                    sp.output_kind = RequestOutputKind.FINAL_ONLY
             elif model_stage == "tts":
                 sp.output_kind = RequestOutputKind.DELTA
         return sampling_params_list

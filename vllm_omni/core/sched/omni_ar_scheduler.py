@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+
 from collections import defaultdict
 from time import time
 from typing import Any
@@ -197,6 +199,27 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        # PROBE_SCHED: schedule() wall (diagnostic only).
+        import time as _time
+
+        _sp = self.__class__.__dict__.get("_probe_sched")
+        if _sp is None:
+            _sp = {"n": 0, "t": 0.0, "tag": 0}
+            setattr(self.__class__, "_probe_sched", _sp)
+        _t0 = _time.perf_counter()
+        try:
+            return self._schedule_probed(throttle_prefills)
+        finally:
+            _sp["t"] += _time.perf_counter() - _t0
+            _sp["n"] += 1
+            if _sp["n"] % 250 == 0 and _sp["n"] // 250 != _sp["tag"]:
+                _sp["tag"] = _sp["n"] // 250
+                logger.warning(
+                    "PROBE_SCHED n=%d mean_schedule=%.2f ms", _sp["n"], 1000.0 * _sp["t"] / 250
+                )
+                _sp["t"] = 0.0
+
+    def _schedule_probed(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
@@ -500,10 +523,23 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if self.chunk_transfer_adapter is not None and (
                 inter_stage_output is not None or is_segment_finished or finished
             ):
+                send_segment_finished = is_segment_finished
+                if (
+                    is_segment_finished
+                    and not finished
+                    and os.environ.get("MINICPMO_STREAM_HANDOFF", "0") == "1"
+                    and self.vllm_config.model_config.stage_id == 1
+                ):
+                    # Plain-stream text handoff: a Talker stop that resumes via
+                    # a queued streaming update is not a duplex segment
+                    # boundary. Forwarding the marker would make the chunk-fed
+                    # Code2Wav stage treat it as end-of-stream and finish the
+                    # whole request while the Talker is still speaking.
+                    send_segment_finished = False
                 self.chunk_transfer_adapter.save_async(
                     inter_stage_output,
                     request,
-                    is_segment_finished,
+                    send_segment_finished,
                 )
 
         # Remove the stopped requests from the running and waiting queues.
