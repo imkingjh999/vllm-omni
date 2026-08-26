@@ -18,7 +18,7 @@ This module:
 from __future__ import annotations
 
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 import torch.nn.functional as F
@@ -107,20 +107,17 @@ def _patched_attention_forward_chunk(
 
 
 @contextmanager
-def npu_math_sdpa_context(*, require_available: bool = False) -> Iterator[None]:
+def npu_math_sdpa_context() -> Iterator[None]:
     """Force SDPA MATH backend so Ascend does not call fused FA."""
-    with ExitStack() as stack:
-        try:
-            from torch.nn.attention import SDPBackend, sdpa_kernel
+    try:
+        from torch.nn.attention import SDPBackend, sdpa_kernel
 
-            stack.enter_context(sdpa_kernel(SDPBackend.MATH))
-        except Exception as exc:
-            if require_available:
-                raise RuntimeError(
-                    "MiniCPM-o Code2Wav NPU graph capture requires torch.nn.attention.sdpa_kernel(SDPBackend.MATH)"
-                ) from exc
-            logger.warning_once("MATH SDPA selection is unavailable; using the default Ascend SDPA backend.")
-        yield
+        with sdpa_kernel(SDPBackend.MATH):
+            yield
+    except Exception:
+        # Older torch / missing backend enum — just run as-is.
+        with nullcontext():
+            yield
 
 
 def _disable_upsample_encoder_compile() -> None:
