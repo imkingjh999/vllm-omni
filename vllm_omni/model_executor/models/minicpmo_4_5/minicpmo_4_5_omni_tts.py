@@ -253,6 +253,10 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         # whole warper chain in numpy (C speed, zero aten dispatch), one
         # torch.multinomial for RNG parity. Opt out with MINICPMO_SAMP_FAST=0.
         self._samp_fast = os.environ.get("MINICPMO_SAMP_FAST", "1") == "1"
+        # E2 plumb-fast: skip per-frame window rebuild plumbing (to/cat/
+        # np.append) that is dead state on the E1 fast path. Opt out with
+        # MINICPMO_PLUMB_FAST=0 (A/B baseline arm).
+        self._plumb_fast = os.environ.get("MINICPMO_PLUMB_FAST", "1") == "1"
         self._samp_pin: torch.Tensor | None = None
         self._stop_row_go: torch.Tensor | None = None
         self._stop_row_stop: torch.Tensor | None = None
@@ -618,7 +622,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         ``.item()`` round-trip). RNG still draws through the per-request
         CPU generator via torch.multinomial.
         """
-        logits = self.head_code[0](hidden_state).float()
+        logits = self.head_code[0](hidden_state)
         vocab_size = logits.shape[-1]
         if self._samp_pin is None or self._samp_pin.shape[-1] != vocab_size:
             self._samp_pin = torch.empty((1, vocab_size), dtype=torch.float32, pin_memory=True)
@@ -666,7 +670,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
 
         _p = self.__class__.__dict__.get("_probe_s1")
         if _p is None:
-            _p = {"last_entry": 0.0, "n": 0, "sum_wall": 0.0, "sum_gap": 0.0}
+            _p = {"last_entry": 0.0, "n": 0, "nf": 0, "sum_wall": 0.0, "sum_gap": 0.0}
             setattr(self.__class__, "_probe_s1", _p)
         _now = _t.perf_counter()
         if _p["last_entry"]:
@@ -675,10 +679,11 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         _p["last_entry"] = _now
         if _p["n"] and _p["n"] % 250 == 0:
             logger.warning(
-                "PROBE_S1 n=%d mean_gap=%.2fms mean_inmodel=%.2fms",
+                "PROBE_S1 n=%d nf=%d mean_gap=%.2fms mean_inmodel=%.2fms",
                 _p["n"],
+                _p["nf"],
                 1000.0 * _p["sum_gap"] / _p["n"],
-                1000.0 * _p["sum_wall"] / _p["n"],
+                1000.0 * _p["sum_wall"] / max(_p["nf"], 1),
             )
             _p["sum_gap"] = 0.0
             _p["sum_wall"] = 0.0
@@ -797,7 +802,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
                 codes = (info.get("audio_codes", {}) or {}).get("accumulated")
             if not isinstance(codes, torch.Tensor):
                 codes = torch.empty(0, dtype=torch.long, device=hidden.device)
-            else:
+            elif codes.device != hidden.device or codes.dtype != torch.long or codes.ndim != 1:
                 codes = codes.to(device=hidden.device, dtype=torch.long).reshape(-1)
             step = int(state.get("step", 0))
             if self._samp_cpu and self._samp_fast and hidden.device.type == "npu":
@@ -820,9 +825,32 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             # returns only codes that were fed into the retained KV state.
             if not is_eos and not reached_limit:
                 delta = torch.tensor([[sampled_id]], dtype=torch.long, device=hidden.device)
-                codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], delta.view(1)])
-                if isinstance(state.get("codes_np"), np.ndarray):
-                    state["codes_np"] = np.append(state["codes_np"][-(_REPETITION_WINDOW - 1) :], sampled_id)
+                if self._plumb_fast:
+                    # E2: on the E1 fast path the torch window is dead state
+                    # (codes_np is authoritative; audio_codes.accumulated has
+                    # no reader outside this method), so skip the per-frame
+                    # slice+cat and np.append realloc: fixed numpy ring.
+                    win = state.get("codes_win")
+                    if not isinstance(win, np.ndarray) or win.shape[0] != _REPETITION_WINDOW:
+                        seed = state.get("codes_np")
+                        seed = seed if isinstance(seed, np.ndarray) else np.empty(0, dtype=np.int64)
+                        tail = seed[-_REPETITION_WINDOW:]
+                        win = np.zeros(_REPETITION_WINDOW, dtype=np.int64)
+                        win[: tail.shape[0]] = tail
+                        state["codes_win"] = win
+                        state["codes_n"] = int(tail.shape[0])
+                    n = int(state.get("codes_n", 0))
+                    if n < _REPETITION_WINDOW:
+                        win[n] = sampled_id
+                        state["codes_n"] = n + 1
+                    else:
+                        win[:-1] = win[1:]
+                        win[-1] = sampled_id
+                    state["codes_np"] = win[: int(state["codes_n"])]
+                else:
+                    codes = torch.cat([codes[-(_REPETITION_WINDOW - 1) :], delta.view(1)])
+                    if isinstance(state.get("codes_np"), np.ndarray):
+                        state["codes_np"] = np.append(state["codes_np"][-(_REPETITION_WINDOW - 1) :], sampled_id)
                 current = delta.view(1)
             else:
                 delta = empty_delta
@@ -856,6 +884,7 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "meta": meta_outputs,
         }
         _p["sum_wall"] += _t.perf_counter() - _now
+        _p["nf"] += 1
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,
