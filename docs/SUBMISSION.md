@@ -7,7 +7,7 @@
 - Fork 地址:https://github.com/imkingjh999/vllm-omni
 - 分支:minicpm-challenge
 - 提交面 commit 链(基于官方 minicpm-challenge,各项见 docs/OPTIMIZATION.md):
-  - `de9d347` plumb-fast → `cab8279` prep-fast → `d2630f6` TF-prefill bypass → **`1c2ad5f` Code2Wav caches(HEAD)**
+  - `de9d347` plumb-fast → `cab8279` prep-fast → `d2630f6` TF-prefill bypass → `1c2ad5f` Code2Wav caches → `2b43522` submission docs → `0bc5323` assistant-prompt bypass fix(代码面 HEAD；本 docs 追补 commit 紧随其后)
 
 ## 提交定位
 基于官方 minicpm-challenge 分支的**推理性能优化**。全部优化以**代码默认值**形式生效:

@@ -34,10 +34,13 @@ vllm serve /workspace/shared_assets/models/OpenBMB/MiniCPM-o-4_5 --omni \
   --host 0.0.0.0 --port 8091
 ```
 
+> 注意:请在 `/tmp` 等非源码目录下执行上面的 `vllm serve`。若在解压出的仓库根目录内启动,当前目录的 `vllm/` 会遮蔽 site-packages 里的 vllm 包导致 import 异常。
+
 ## 5. 评测命令
 
 ### 5.1 TTS 性能(官方 dfx 口径)
 ```bash
+export HF_HUB_OFFLINE=1   # 离线环境必加：评估初始化会访问 HuggingFace，不通时卡死
 vllm bench serve --omni --host 127.0.0.1 --port 8091 \
   --model openbmb/MiniCPM-o-4_5 \
   --tokenizer /workspace/shared_assets/models/OpenBMB/MiniCPM-o-4_5 \
@@ -52,6 +55,7 @@ vllm bench serve --omni --host 127.0.0.1 --port 8091 \
 ### 5.2 TTS WER(全量 2020)
 ```bash
 export SEED_TTS_EVAL_DEVICE=npu:0   # NPU 并发转写约 25 分钟;CPU 约 6 小时
+export HF_HUB_OFFLINE=1   # 离线环境必加，否则评估初始化卡死
 vllm bench serve --omni --port 8091 --max-concurrency 16 \
   --dataset-name seed-tts --dataset-path /workspace/user_data/seedtts_testset \
   --seed-tts-locale zh --num-prompts 2020 --disable-shuffle --no-oversample \
