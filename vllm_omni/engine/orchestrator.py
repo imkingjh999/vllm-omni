@@ -636,6 +636,84 @@ class Orchestrator:
                     except Exception:
                         logger.exception("[Orchestrator] Duplex expiry cleanup failed; retrying on next tick")
 
+    def _maybe_apply_tts_prefill_bypass(self, msg: Any, prompt: Any, req_state: "OrchestratorRequestState") -> None:
+        """TF-prefill fast path for pure-TTS (given-text) requests.
+
+        Seed-tts style requests carry the text to speak in the user
+        message, so the thinker's autoregressive span is pure overhead on
+        the TTFP critical path. Rewrite the stage-0 prompt so the spoken
+        text is teacher-forced into the prompt tail (...<|tts_bos|> text
+        <|tts_eos|>) and cap stage-0 decoding at one token. Unmodified
+        llm2tts still slices the same tts span (its last-<|tts_bos|>
+        search covers the prompt) and the talker is conditioned on prefill
+        hidden states, cutting the thinker decode span from TTFP. Normal
+        chat / omni-eval requests never match the gate: their prompts do
+        not end with <|tts_bos|>. On by default; set MINICPMO_TTS_BYPASS=0
+        to fall back to the normal thinker-decode path.
+        """
+        if os.environ.get("MINICPMO_TTS_BYPASS", "1") == "0":
+            return
+        try:
+            if getattr(req_state, "duplex_identity", None) is not None:
+                return
+            if set(req_state.final_output_stage_ids or []) != {0, 2}:
+                return
+
+            def _pget(container, key, default=None):
+                if isinstance(container, dict):
+                    return container.get(key, default)
+                return getattr(container, key, default)
+
+            if _pget(prompt, "resumable", False):
+                return
+            token_ids = list(_pget(prompt, "prompt_token_ids", None) or [])
+            # use_tts_template renders the stage-0 prompt tail as <|tts_bos|>.
+            if not token_ids or token_ids[-1] != 151703:
+                return
+            tokenizer = getattr(self.stage_pools[0].output_processor, "tokenizer", None)
+            decode = getattr(tokenizer, "decode", None)
+            encode = getattr(tokenizer, "encode", None)
+            if not (callable(decode) and callable(encode)):
+                return
+            rendered = decode(token_ids)
+            marker = "<|im_start|>user\n"
+            start = rendered.rfind(marker)
+            if start < 0:
+                return
+            start += len(marker)
+            end = rendered.find("<|im_end|>", start)
+            if end < 0:
+                return
+            given = rendered[start:end].strip()
+            # Refuse anything that smuggles special markers into the tts span.
+            if not given or "<|" in given:
+                return
+            spoken_ids = list(encode(given, add_special_tokens=False))
+            if not spoken_ids:
+                return
+            stage0_params = req_state.sampling_params_list[0]
+            try:
+                stage0_params.max_tokens = 1
+            except Exception:
+                logger.warning(
+                    "[Orchestrator] TTS prefill bypass: cannot cap stage-0 max_tokens for req=%s; normal path",
+                    req_state.request_id,
+                )
+                return
+            new_ids = token_ids + spoken_ids + [151704]
+            if isinstance(prompt, dict):
+                prompt["prompt_token_ids"] = new_ids
+            else:
+                prompt.prompt_token_ids = new_ids
+            req_state.bypass_echo_text = given
+            logger.info(
+                "[Orchestrator] TTS prefill bypass engaged req=%s spoken_tokens=%d",
+                req_state.request_id,
+                len(spoken_ids),
+            )
+        except Exception:
+            logger.warning("[Orchestrator] TTS prefill bypass gate failed; using normal path", exc_info=True)
+
     async def _handle_add_request(self, msg: StageSubmissionMessage) -> None:
         """Handle an add_request message from the main thread."""
         stage_id = 0
@@ -673,6 +751,7 @@ class Orchestrator:
         self._register_running_request(req_state)
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
+        self._maybe_apply_tts_prefill_bypass(msg, prompt, req_state)
         enqueue_ts = msg.enqueue_ts
         if enqueue_ts > 0:
             req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
@@ -1251,6 +1330,16 @@ class Orchestrator:
             stage_id == 0 and self._is_duplex_session_request(req_state) and req_state.streaming.segment_finished
         )
         if self.stage_pools[stage_id].final_output and not is_duplex_stage0_segment:
+            _bypass_echo = getattr(req_state, "bypass_echo_text", None)
+            if _bypass_echo and stage_id == 0:
+                # TF-prefill bypass: the thinker's own 1-token detokenized
+                # text is meaningless; surface the given text instead, once,
+                # on the finished frame.
+                for _completion in getattr(output, "outputs", None) or []:
+                    try:
+                        _completion.text = _bypass_echo if output.finished else ""
+                    except Exception:
+                        pass
             await self.output_async_queue.put(
                 OutputMessage(
                     request_id=req_id,
