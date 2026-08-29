@@ -147,6 +147,241 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         super().load_model(*args, **kwargs)
         self._resolve_duplex_sampling_hook(force=True)
 
+    # minicpm-challenge: prep-fast (Slice B2b). Steady-state decode fast
+    # path for _prepare_inputs; see the docstring below. Falls back to the
+    # parent implementation for any frame that is not exactly one running
+    # request with one scheduled token (prefill, chunked, spec, PCP, ...).
+    def _prepare_inputs(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: np.ndarray,
+    ) -> tuple[torch.Tensor, "SpecDecodeMetadata | None", int]:
+        import os
+
+        if os.environ.get("MINICPMO_PREP_FAST", "1") != "0":
+            try:
+                r = self._prep_fast(scheduler_output, num_scheduled_tokens)
+                if r is not None:
+                    return r
+            except Exception:
+                # Leave no stale optimization state behind; the parent
+                # implementation rewrites every buffer from scratch.
+                self._pf_state = None
+                if not getattr(self, "_pf_err_logged", False):
+                    self._pf_err_logged = True
+                    try:
+                        import logging
+
+                        logging.getLogger(
+                            "vllm.omni.prep_fast"
+                        ).exception("prep-fast: falling back to parent")
+                    except Exception:
+                        pass
+        return super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
+
+    def _prep_fast(
+        self, scheduler_output: "SchedulerOutput", num_scheduled_tokens: np.ndarray
+    ) -> tuple[torch.Tensor, None, int] | None:
+        """1-req / 1-token decode fast path. None => use parent path."""
+        import os
+
+        ib = self.input_batch
+        dbg = os.environ.get("MINICPMO_PREP_FAST_DEBUG") == "1"
+
+        def bail(reason: str):
+            if dbg:
+                seen = getattr(self, "_pf_dbg", None)
+                if seen is None:
+                    seen = self._pf_dbg = {"n": 0, "reasons": {}}
+                if reason not in seen["reasons"]:
+                    seen["reasons"][reason] = True
+                    seen["n"] += 1
+                    if seen["n"] <= 5:
+                        try:
+                            import logging
+
+                            logging.getLogger(
+                                "vllm.omni.prep_fast"
+                            ).info("prep-fast guard: %s", reason)
+                        except Exception:
+                            pass
+            return None
+
+        if ib.num_reqs != 1:
+            return bail(f"num_reqs={ib.num_reqs}")
+        if num_scheduled_tokens[0] != 1:
+            return bail(f"nsched={num_scheduled_tokens[0]}")
+        if scheduler_output.total_num_scheduled_tokens != 1:
+            return bail("total!=1")
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return bail("spec_tokens")
+        if getattr(self, "speculative_config", None):
+            return bail("spec_config")
+        if getattr(self, "pcp_size", 1) > 1 or getattr(self, "use_cp", False):
+            return bail("pcp/cp")
+        if getattr(self, "uses_mrope", False) or getattr(
+            self, "uses_xdrope_dim", 0
+        ) > 0:
+            return bail("mrope/xdrope")
+        if getattr(self, "_has_gdn", False):
+            return bail("gdn")
+        if getattr(self, "enable_prompt_embeds", False) or ib.req_prompt_embeds:
+            return bail("prompt_embeds")
+        if getattr(self, "use_async_spec_decode", False):
+            return bail("async_spec")
+        pos0 = int(ib.num_computed_tokens_cpu[0])
+        if pos0 == 0:
+            return bail("pos0=0")
+
+        st = getattr(self, "_pf_state", None)
+        if st is None:
+            st = self._pf_state = {
+                "bt_rows": None,       # last committed row snapshot per group
+                "slot": "unverified",  # unverified | ok | bad
+                "ids_np": hasattr(self.input_ids, "np"),
+            }
+
+        # Side effects the rest of the frame depends on.
+        self._build_attn_state(1, num_scheduled_tokens, num_scheduled_tokens)
+        self.with_prefill = False  # DecodeOnly branch
+        self.query_lens = torch.from_numpy(num_scheduled_tokens)
+
+        bt = ib.block_table
+        groups = getattr(bt, "block_tables", None)
+        if groups is None:
+            groups = [bt]
+        if st["bt_rows"] is None or len(st["bt_rows"]) != len(groups):
+            st["bt_rows"] = [None] * len(groups)
+
+        # Block table: upstream commits the full-width row of every KV-cache
+        # group each frame; for decode a row only changes when a new block is
+        # appended. Skip a group's copy when its row 0 content is unchanged
+        # (content compare, not a flag).
+        for gi, g in enumerate(groups):
+            nb = int(g.num_blocks_per_row[0])
+            row = g.block_table.np[0, :nb]
+            cached = st["bt_rows"][gi]
+            if (
+                cached is None
+                or row.shape != cached.shape
+                or not np.array_equal(row, cached)
+            ):
+                g.block_table.copy_to_gpu(1)
+                st["bt_rows"][gi] = row.copy()
+
+        # input_ids: under async scheduling the scheduler has not committed
+        # the previous step's sampled token to token_ids_cpu, so for a
+        # continuing request (prev row >= 0) the token is copied on device
+        # from prev_sampled_token_ids — the same slice the upstream
+        # common-case optimization uses. Otherwise it is a single scalar
+        # read from the host token table.
+        self._compute_prev_positions(1)
+        pv = int(self.prev_positions.np[0])
+        if pv >= 0 and ib.prev_sampled_token_ids is not None:
+            self.input_ids.gpu[:1].copy_(
+                ib.prev_sampled_token_ids[pv : pv + 1, 0], non_blocking=True
+            )
+        else:
+            tid = ib.token_ids_cpu[0, pos0]
+            if st["ids_np"]:
+                self.input_ids.np[0] = tid
+            else:
+                self.input_ids.cpu[0] = tid
+            self.input_ids.copy_to_gpu(1)
+
+        # Constant-for-decode buffers: upstream re-writes and re-copies these
+        # every frame; the copies are n=1/2 slices (never the full buffer).
+        self.query_pos.np[0] = 0
+        self.query_pos.copy_to_gpu(1)
+        qsl = self.query_start_loc
+        qsl.np[0] = 0
+        qsl.np[1] = 1
+        qsl.copy_to_gpu(2)
+        self.req_indices.np[0] = 0
+        self.req_indices.copy_to_gpu(1)
+        self.num_scheduled_tokens.np[0] = 1
+        self.num_scheduled_tokens.copy_to_gpu(1)
+
+        # seq_lens[:1] == optimistic value (computed + 1); write the pinned
+        # host buffer once and do a single non_blocking H2D slice copy
+        # instead of the upstream device-side add chain. The gpu tails
+        # (qsl -1 fill / seq_lens 0 / num_accepted all-ones) are maintained
+        # by every parent-path frame and are not written by anything else.
+        opt = self.optimistic_seq_lens_cpu
+        opt[0] = pos0 + 1
+        self.seq_lens[:1].copy_(opt[:1], non_blocking=True)
+        self.num_computed_tokens[:1].copy_(
+            ib.num_computed_tokens_cpu_tensor[:1], non_blocking=True
+        )
+        self._positions_np_buf[0] = pos0
+        self.positions[:1].copy_(
+            self._positions_cpu_buf[:1], non_blocking=True
+        )
+
+        # num_accepted_tokens: under async scheduling upstream synchronizes
+        # the recorded event and mirrors the per-request accepted count (1
+        # for non-spec decode) into the pinned buffer, then copies it up.
+        # The gpu tail stays all-ones from the surrounding parent frames.
+        evt = getattr(self, "num_accepted_tokens_event", None)
+        if evt is not None:
+            evt.synchronize()
+            na = self.num_accepted_tokens
+            if pv >= 0:
+                na.np[0] = ib.num_accepted_tokens_cpu[pv]
+                ib.num_accepted_tokens_cpu[0] = na.np[0]
+            else:
+                na.np[0] = 1
+                ib.num_accepted_tokens_cpu[0] = 1
+            na.copy_to_gpu(1)
+
+        # Discard bookkeeping: scalar equivalent of the upstream mask math.
+        nt = self.requests[ib.req_ids[0]].num_tokens
+        mask0 = (pos0 + 1) < nt
+        if mask0:
+            self.discard_request_indices.np[0] = 0
+            self.discard_request_indices.copy_to_gpu(1)
+            self.num_discarded_requests = 1
+        else:
+            self.num_discarded_requests = 0
+        self.discard_request_mask.np[0] = mask0
+        self.discard_request_mask.copy_to_gpu(1)
+
+        # Slot mapping: the general path launches the jit kernel once per
+        # KV-cache group per frame (vllm_ascend.worker.block_table wraps
+        # vllm core's _compute_slot_mapping_kernel). For one token each
+        # group's slot is a host scalar following the kernel's math:
+        #   vbi, voff = divmod(pos, physical_block_size)
+        #   bt_idx = vbi * blocks_per_phys_block + voff // block_size
+        #   slot = bt[row, bt_idx] * block_size + voff % block_size
+        # Verified against the real kernel on the first fast frame per boot
+        # (torch.equal, per group); any mismatch keeps the kernel running.
+        for g in groups:
+            pbs = g.physical_block_size
+            lbs = g.block_size
+            bpp = g.blocks_per_phys_block
+            vbi, voff = divmod(pos0, pbs)
+            bi = vbi * bpp + voff // lbs
+            slot = int(g.block_table.np[0, bi]) * lbs + (voff % lbs)
+            sm = g.slot_mapping
+            if st["slot"] == "ok":
+                sm.np[0] = slot
+                sm.copy_to_gpu(1)
+            else:
+                g.compute_slot_mapping(
+                    1, self.query_start_loc.gpu[:2], self.positions[:1]
+                )
+                if st["slot"] == "unverified":
+                    exp = torch.tensor(
+                        [slot], dtype=sm.gpu.dtype, device=sm.gpu.device
+                    )
+                    if not bool(torch.equal(sm.gpu[:1], exp)):
+                        st["slot"] = "bad"
+        if st["slot"] == "unverified":
+            st["slot"] = "ok"
+
+        logits_indices = self.query_start_loc.gpu[1:2] - 1
+        return logits_indices, None, 1
+
     def _update_states(self, scheduler_output: SchedulerOutput):
         deferred_state_corrections_fn = super()._update_states(scheduler_output)
         self._update_duplex_sampling_states(scheduler_output)
@@ -1307,3 +1542,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return str(global_id)
         return req_id
     #  -------------------------------------- Omni-new -------------------------------------------------
+
+
+# minicpm-challenge: profile-skip hook (Slice B2); see profile_skip.py.
+try:
+    from vllm_omni.platforms.npu.profile_skip import install_profile_skip
+
+    install_profile_skip()
+except Exception:
+    pass
