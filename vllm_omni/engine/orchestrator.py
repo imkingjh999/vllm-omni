@@ -684,6 +684,15 @@ class Orchestrator:
             end = rendered.find("<|im_end|>", start)
             if end < 0:
                 return
+            # Assistant-style system prompts (e.g. the gradio demo's
+            # audio_assistant prompt) ask the model to compose a reply rather
+            # than read the user message; bypassing there would just echo the
+            # user's input back. Only given-text TTS tasks may take this path.
+            sys_start = rendered.find("<|im_start|>system\n")
+            sys_end = rendered.find("<|im_end|>", sys_start) if sys_start >= 0 else -1
+            system_text = rendered[sys_start:sys_end] if sys_start >= 0 and sys_end > sys_start else ""
+            if any(m in system_text for m in ("面壁小钢炮", "当一个助手", "multimodal assistant", "above voice style")):
+                return
             given = rendered[start:end].strip()
             # Refuse anything that smuggles special markers into the tts span.
             if not given or "<|" in given:
