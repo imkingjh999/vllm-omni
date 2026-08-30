@@ -665,28 +665,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
         model_outputs: torch.Tensor | OmniOutput,
         **kwargs: Any,
     ) -> OmniOutput:
-        # PROBE_S1: frame cadence vs in-model wall (diagnostic only).
-        import time as _t
-
-        _p = self.__class__.__dict__.get("_probe_s1")
-        if _p is None:
-            _p = {"last_entry": 0.0, "n": 0, "nf": 0, "sum_wall": 0.0, "sum_gap": 0.0}
-            setattr(self.__class__, "_probe_s1", _p)
-        _now = _t.perf_counter()
-        if _p["last_entry"]:
-            _p["sum_gap"] += _now - _p["last_entry"]
-            _p["n"] += 1
-        _p["last_entry"] = _now
-        if _p["n"] and _p["n"] % 250 == 0:
-            logger.warning(
-                "PROBE_S1 n=%d nf=%d mean_gap=%.2fms mean_inmodel=%.2fms",
-                _p["n"],
-                _p["nf"],
-                1000.0 * _p["sum_gap"] / _p["n"],
-                1000.0 * _p["sum_wall"] / max(_p["nf"], 1),
-            )
-            _p["sum_gap"] = 0.0
-            _p["sum_wall"] = 0.0
         if isinstance(model_outputs, OmniOutput):
             return model_outputs
         hidden = model_outputs
@@ -883,8 +861,6 @@ class MiniCPMO45OmniTTSForConditionalGeneration(nn.Module, SupportsPP):
             "codes": {"audio": codec_deltas},
             "meta": meta_outputs,
         }
-        _p["sum_wall"] += _t.perf_counter() - _now
-        _p["nf"] += 1
         return OmniOutput(
             text_hidden_states=hidden,
             multimodal_outputs=multimodal_outputs,

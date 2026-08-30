@@ -1063,7 +1063,10 @@ def llm2tts(
         if ref_audio is not None:
             ref_waveform, ref_sr = ref_audio
             set_ref_audio(model_intermediate_buffer, _to_transport_list(ref_waveform), ref_sr)
-        handoff_hidden = _to_transport_list(tts_hidden_slice) if tts_hidden_slice is not None else None
+        # Pass the tensor through: set_tts_handoff packs it as raw bytes
+        # (bit-exact msgspec bin transport). len() below keeps its meaning
+        # because len(torch.Tensor) == shape[0] == row count == len(old list).
+        handoff_hidden = tts_hidden_slice
         native_turn_end_handoff = False
         if is_native_duplex_handoff:
             turn_eos_id = special_token_ids.get("turn_eos_token_id")

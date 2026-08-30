@@ -50,7 +50,7 @@ from vllm_omni.engine.messages import (
     UnregisterRemoteReplicaMessage,
 )
 from vllm_omni.engine.orchestrator_monitor import create_orch_monitor, replica_key
-from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.serialization import deserialize_additional_information, serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.metrics.prometheus import OmniRequestCounter
 from vllm_omni.metrics.stat_logger import OmniPrometheusStatLogger
@@ -701,6 +701,9 @@ class Orchestrator:
             if not spoken_ids:
                 return
             stage0_params = req_state.sampling_params_list[0]
+            wants_logprobs = bool(getattr(stage0_params, "logprobs", None)) or bool(
+                getattr(stage0_params, "prompt_logprobs", None)
+            )
             try:
                 stage0_params.max_tokens = 1
             except Exception:
@@ -720,6 +723,31 @@ class Orchestrator:
                 req_state.request_id,
                 len(spoken_ids),
             )
+            # Stage-0's single sampled token is discarded (echo overwrite) and
+            # the talker slices its span out of the rewritten prompt, so the
+            # lm_head GEMM + sampler on the prefill step are pure overhead.
+            # Tag the request so the runner can skip them; refusable without
+            # losing the bypass itself.
+            if not wants_logprobs:
+                try:
+                    if isinstance(prompt, dict):
+                        raw_info = prompt.get("additional_information")
+                        merged_info = dict(raw_info) if isinstance(raw_info, dict) else {}
+                        merged_info["skip_logits"] = True
+                        prompt["additional_information"] = merged_info
+                    else:
+                        merged_info = deserialize_additional_information(
+                            getattr(prompt, "additional_information", None)
+                        ) or {}
+                        merged_info["skip_logits"] = True
+                        prompt.additional_information = serialize_additional_information(merged_info)
+                except Exception:
+                    logger.debug(
+                        "[Orchestrator] TTS prefill bypass: skip_logits tag not set, "
+                        "normal sampling kept for req=%s",
+                        req_state.request_id,
+                        exc_info=True,
+                    )
         except Exception:
             logger.warning("[Orchestrator] TTS prefill bypass gate failed; using normal path", exc_info=True)
 

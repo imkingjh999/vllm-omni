@@ -199,32 +199,15 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         return False
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        # PROBE_SCHED: schedule() wall (diagnostic only).
-        import time as _time
-
-        _sp = self.__class__.__dict__.get("_probe_sched")
-        if _sp is None:
-            _sp = {"n": 0, "t": 0.0, "tag": 0}
-            setattr(self.__class__, "_probe_sched", _sp)
-        _t0 = _time.perf_counter()
-        try:
-            return self._schedule_probed(throttle_prefills)
-        finally:
-            _sp["t"] += _time.perf_counter() - _t0
-            _sp["n"] += 1
-            if _sp["n"] % 250 == 0 and _sp["n"] // 250 != _sp["tag"]:
-                _sp["tag"] = _sp["n"] // 250
-                logger.warning(
-                    "PROBE_SCHED n=%d mean_schedule=%.2f ms", _sp["n"], 1000.0 * _sp["t"] / 250
-                )
-                _sp["t"] = 0.0
-
-    def _schedule_probed(self, throttle_prefills: bool = False) -> SchedulerOutput:
         # Remove FINISHED_ABORTED requests before the upstream scheduler sees
         # them. Upstream vllm raises RuntimeError on this status; omni allows
         # async abort (e.g. client disconnect during TTS streaming) to leave
         # requests in the waiting/running queues temporarily.
         for queue in (self.waiting, self.running):
+            # Fast path: nothing to evict — skip the snapshot copy. Empty
+            # queues return True from all() without iterating.
+            if all(getattr(req, "status", None) != RequestStatus.FINISHED_ABORTED for req in queue):
+                continue
             for req in list(queue):
                 if getattr(req, "status", None) == RequestStatus.FINISHED_ABORTED:
                     queue.remove(req)

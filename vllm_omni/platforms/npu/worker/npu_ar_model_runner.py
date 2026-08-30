@@ -23,6 +23,7 @@ from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
     ECConnectorOutput,
+    SamplerOutput,
     make_empty_encoder_model_runner_output,
 )
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
@@ -32,6 +33,7 @@ from vllm.v1.worker.gpu_model_runner import AsyncGPUModelRunnerOutput, PerLayerA
 from vllm.v1.worker.mamba_utils import preprocess_mamba
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
+from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
 
@@ -85,6 +87,16 @@ def _ensure_tensor_values(payload: dict[str, object]) -> dict[str, torch.Tensor]
     return result
 
 
+# TTS prefill bypass placeholder: the stage-0 token is echo-overwritten by
+# the orchestrator and sits OUTSIDE the llm2tts [tts_bos, tts_eos) slice, so
+# any id that is not 151703 (<|tts_bos|>) keeps stage-1 conditioning identical.
+# 0 is far from the 1516xx special range.
+_BYPASS_SKIP_LOGITS_EOS_ID = 151645  # <|im_end|>: the greedy token the bypassed
+# prefill step would sample; check_stop() stops the stage-0 request on it
+# (Request.max_tokens is copied before the orchestrator caps it, so the
+# EOS hit — not the cap — is what terminates the bypass request).
+
+
 class ExecuteModelState(NamedTuple):
     """Ephemeral cached state transferred between execute_model() and
     sample_tokens(), after execute_model() returns None."""
@@ -105,6 +117,7 @@ class ExecuteModelState(NamedTuple):
 
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, DuplexSamplingRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
+    _skip_logits_step = False  # TTS prefill bypass: skip lm_head+sampler for the step
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -142,6 +155,10 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             )
         self._downstream_payload_cache: dict[str, bool] = {}
         self._init_duplex_sampling_state()
+        # [Omni] Single-request decode cache for _build_attention_metadata.
+        # Entry: (key, attn_metadata); spec_decode_common is always None in
+        # the eligible regime (speculative_config is None).
+        self._cached_attn_meta: tuple[tuple, PerLayerAttnMetadata] | None = None
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -543,6 +560,23 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             return None
         return wire_payloads
 
+
+    def _skip_logits_for_batch(self) -> bool:
+        """True when EVERY request in the persistent batch carries the
+        orchestrator's skip_logits tag (TTS prefill bypass; the sampled
+        token is discarded downstream). Any miss -> normal lm_head path."""
+        num_reqs = self.input_batch.num_reqs
+        if num_reqs == 0:
+            return False
+        req_ids = self.input_batch.req_ids
+        for i in range(num_reqs):
+            info = self.model_intermediate_buffer.get(req_ids[i])
+            if not isinstance(info, dict):
+                req_state = self.requests.get(req_ids[i])
+                info = getattr(req_state, "additional_information_cpu", None)
+            if not isinstance(info, dict) or info.get("skip_logits") is not True:
+                return False
+        return True
 
     def _request_final_stage_id(self, req_id: str) -> int | None:
         info = self.model_intermediate_buffer.get(req_id)
@@ -1036,13 +1070,25 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
                 sample_hidden_states = hidden_states[logits_indices]
                 #  -------------------------------------- Omni-new -------------------------------------------------
-                # Try with sampling_metadata first; fall back to without for models that don't support it
-                try:
-                    logits = self.model.compute_logits(
-                        sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                self._skip_logits_step = spec_decode_metadata is None and self._skip_logits_for_batch()
+                if self._skip_logits_step:
+                    # TTS prefill bypass: every request in this batch discards
+                    # its sampled token (orchestrator echo overwrite), so skip
+                    # the lm_head GEMM; a zero-logits tensor keeps every
+                    # downstream shape/None consumer intact.
+                    logits = torch.zeros(
+                        (sample_hidden_states.shape[0], self.model_config.get_vocab_size()),
+                        dtype=torch.float32,
+                        device=sample_hidden_states.device,
                     )
-                except TypeError:
-                    logits = self.model.compute_logits(sample_hidden_states)
+                else:
+                    # Try with sampling_metadata first; fall back to without for models that don't support it
+                    try:
+                        logits = self.model.compute_logits(
+                            sample_hidden_states, sampling_metadata=self.input_batch.sampling_metadata
+                        )
+                    except TypeError:
+                        logits = self.model.compute_logits(sample_hidden_states)
                 #  -------------------------------------- Omni-new -------------------------------------------------
             else:
                 # Rare case.
@@ -1100,6 +1146,127 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             self._omni_routed_experts_d2h(scheduler_output)
 
         return None
+
+    #  -------------------------------------- Omni-new -------------------------------------------------
+    def _attn_meta_cache_eligible(self) -> bool:
+        # One-time config guards: any feature that changes what the upstream
+        # builder produces or adds per-frame side effects disables the cache.
+        return (
+            self.speculative_config is None
+            and not self.use_async_spec_decode
+            and self.pcp_size == 1
+            and not self.use_cp
+            and not self._has_gdn
+            and not self.enable_hamming_sparse
+            and not self.is_mm_prefix_lm
+            and not self.model_config.enable_return_routed_experts
+            and not self.cache_config.kv_sharing_fast_prefill
+            and len(self.kv_cache_config.kv_cache_groups) == 1
+        )
+
+    def _build_attention_metadata(
+        self,
+        num_tokens: int,
+        num_reqs: int,
+        max_query_len: int,
+        num_tokens_padded: int | None = None,
+        num_reqs_padded: int | None = None,
+        ubatch_slices=None,
+        logits_indices: torch.Tensor | None = None,
+        use_spec_decode: bool = False,
+        for_cudagraph_capture: bool = False,
+        num_scheduled_tokens=None,
+        num_scheduled_tokens_np: "np.ndarray | None" = None,
+        cascade_attn_prefix_lens=None,
+    ):
+        # [Omni] Fast path: in the steady single-request decode regime every
+        # tensor field of the built metadata is a live view of a persistent
+        # in-place buffer, so the dict can be reused; only the serialized
+        # python lists (seq_lens_list / actual_seq_lengths_q) plus the padding
+        # side effects must be refreshed each frame.
+        cacheable = (
+            self._attn_meta_cache_eligible()
+            and not for_cudagraph_capture
+            and not use_spec_decode
+            and ubatch_slices is None
+            and cascade_attn_prefix_lens is None
+            and num_reqs == 1
+            and num_tokens == 1
+            and max_query_len == 1
+            and num_tokens_padded is not None
+            and num_reqs_padded is not None
+            and self.attn_state == AscendAttentionState.DecodeOnly
+        )
+        key = None
+        if cacheable:
+            req_id = self.input_batch.req_ids[0]
+            key = (req_id, num_tokens, num_tokens_padded, num_reqs, num_reqs_padded, max_query_len)
+            cached = self._cached_attn_meta
+            if cached is not None and cached[0] == key:
+                self._refresh_cached_attention_metadata(
+                    cached[1], num_reqs, num_reqs_padded, num_tokens, num_tokens_padded
+                )
+                return cached[1], None
+
+        result = super()._build_attention_metadata(
+            num_tokens=num_tokens,
+            num_reqs=num_reqs,
+            max_query_len=max_query_len,
+            num_tokens_padded=num_tokens_padded,
+            num_reqs_padded=num_reqs_padded,
+            ubatch_slices=ubatch_slices,
+            logits_indices=logits_indices,
+            use_spec_decode=use_spec_decode,
+            for_cudagraph_capture=for_cudagraph_capture,
+            num_scheduled_tokens=num_scheduled_tokens,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            cascade_attn_prefix_lens=cascade_attn_prefix_lens,
+        )
+        if key is not None:
+            attn_metadata, spec_common = result
+            if spec_common is None:
+                self._cached_attn_meta = (key, attn_metadata)
+        return result
+
+    def _refresh_cached_attention_metadata(
+        self,
+        attn_metadata: PerLayerAttnMetadata,
+        num_reqs: int,
+        num_reqs_padded: int,
+        num_tokens: int,
+        num_tokens_padded: int,
+    ) -> None:
+        # Live buffers are refreshed in place by _prepare_inputs (and by
+        # _pad_query_start_loc_for_fia) before this runs each frame.
+        qsl_cpu = self.query_start_loc.cpu
+        if callable(qsl_cpu):
+            qsl_cpu = qsl_cpu()
+        qsl_cpu = qsl_cpu[: num_reqs_padded + 1]
+        seq_lens_live = self.optimistic_seq_lens_cpu[:num_reqs_padded]
+        # Replicate the builder's padding side effects on the live buffers
+        # exactly (empty slices are aten no-ops in the unpadded regime).
+        slot_mapping = self.input_batch.block_table[0].slot_mapping.gpu[:num_tokens_padded]
+        slot_mapping[num_tokens:num_tokens_padded].fill_(-1)
+        blk_table_tensor = self.input_batch.block_table[0].get_device_tensor()[:num_reqs_padded]
+        blk_table_tensor[num_reqs:num_reqs_padded].fill_(0)
+        seen: set[int] = set()
+        for meta in attn_metadata.values():
+            if id(meta) in seen:
+                continue
+            seen.add(id(meta))
+            # Serialized host copies: the only values the FULL-graph replay
+            # update loop re-reads every frame. Must be rebuilt per frame.
+            meta.actual_seq_lengths_q = qsl_cpu[1:].tolist()
+            meta.seq_lens_list = seq_lens_live.tolist()
+            # Live views: rebind so the object always tracks the persistent
+            # buffers (identical to what a fresh build would install).
+            meta.seq_lens = seq_lens_live
+            meta.seq_lens_cpu = seq_lens_live
+            if meta.query_start_loc is not None:
+                # Keep the device copy byte-identical for any eager fallback
+                # frame, without the per-frame pin_memory() allocation.
+                meta.query_start_loc.copy_(qsl_cpu, non_blocking=True)
+    #  -------------------------------------- Omni-new -------------------------------------------------
 
     def _sample(
         self,
@@ -1218,7 +1385,21 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
 
         with record_function_or_nullcontext("sample_token"):
-            sampler_output = self._sample(logits, spec_decode_metadata)
+            if self._skip_logits_step:
+                # Bypass: the real token is echo-overwritten by the orchestrator;
+                # emit a fixed placeholder outside the tts_bos/tts_end id set so
+                # the llm2tts span slice (prompt + this token) is unchanged.
+                sampler_output = SamplerOutput(
+                    sampled_token_ids=torch.full(
+                        (sample_hidden_states.shape[0], 1),
+                        _BYPASS_SKIP_LOGITS_EOS_ID,
+                        dtype=torch.int32,
+                        device=sample_hidden_states.device,
+                    ),
+                    logprobs_tensors=None,
+                )
+            else:
+                sampler_output = self._sample(logits, spec_decode_metadata)
 
         if self.need_accepted_tokens:
             if self.sampling_done_event is None:
