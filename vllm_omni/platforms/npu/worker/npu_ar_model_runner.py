@@ -35,7 +35,7 @@ from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
 from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
-from vllm_ascend.compilation.acl_graph import ACLGraphWrapper
+from vllm_ascend.compilation.acl_graph import ACLGraphWrapper, get_graph_params
 
 # yapf conflicts with isort for this block
 # yapf: disable
@@ -48,6 +48,8 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.distributed.omni_connectors.utils.config import get_stage_connector_role, stage_sends_async_output
 from vllm_omni.experimental.fullduplex.model_executor import DuplexSamplingRunnerMixin
 from vllm_omni.outputs import OmniModelRunnerOutput
+from vllm_omni.platforms.npu.minicpmo_fia_pad import STATE as FIA_PAD_STATE
+from vllm_omni.platforms.npu.minicpmo_fia_pad import fia_pad_mode, talker_gate
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, partition_payload_list, to_payload_element
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
@@ -159,6 +161,35 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # Entry: (key, attn_metadata); spec_decode_common is always None in
         # the eligible regime (speculative_config is None).
         self._cached_attn_meta: tuple[tuple, PerLayerAttnMetadata] | None = None
+        # [minicpm-challenge: A-tier FIA pad] per-engine gate + persistent
+        # buffers (see vllm_omni/platforms/npu/minicpmo_fia_pad.py). The
+        # talker-only gate keeps stage0 (which shares this runner class) and
+        # stage2 fully stock.
+        FIA_PAD_STATE.mode = fia_pad_mode()
+        if FIA_PAD_STATE.mode != 0 and talker_gate(self.model_config):
+            FIA_PAD_STATE.enabled = True
+            FIA_PAD_STATE.degraded = FIA_PAD_STATE.mode == 2
+            dev = self.device
+            FIA_PAD_STATE.klen_dev = torch.zeros(1, dtype=torch.int32, device=dev)
+            FIA_PAD_STATE.klen_host = torch.zeros(1, dtype=torch.int32, pin_memory=True)
+            FIA_PAD_STATE.klen_host[0] = FIA_PAD_STATE.KV_PAD
+            FIA_PAD_STATE.klen_dev.copy_(FIA_PAD_STATE.klen_host)
+            FIA_PAD_STATE.arange_buf = (
+                torch.arange(FIA_PAD_STATE.KV_MAX, dtype=torch.int32, device=dev)
+                .view(1, 1, 1, -1)
+                .contiguous()
+            )
+            FIA_PAD_STATE.cmp_buf = torch.zeros(
+                1, 1, 1, FIA_PAD_STATE.KV_MAX, dtype=torch.bool, device=dev
+            )
+            FIA_PAD_STATE.mask_buf = torch.ones(
+                1, 1, 1, FIA_PAD_STATE.KV_MAX, dtype=torch.int8, device=dev
+            )
+            logger.info(
+                "[fia_pad] stage1 talker gate OPEN (mode=%d degraded=%s)",
+                FIA_PAD_STATE.mode,
+                FIA_PAD_STATE.degraded,
+            )
 
     def load_model(self, *args, **kwargs) -> None:
         super().load_model(*args, **kwargs)
@@ -327,6 +358,14 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         opt = self.optimistic_seq_lens_cpu
         opt[0] = pos0 + 1
         self.seq_lens[:1].copy_(opt[:1], non_blocking=True)
+        if FIA_PAD_STATE.enabled:
+            # [minicpm-challenge: A-tier FIA pad] publish the current klen to
+            # the device scalar the captured in-graph mask rebuild reads
+            # (enqueued on the compute stream, ordered before the replay).
+            FIA_PAD_STATE.klen_host[0] = pos0 + 1
+            FIA_PAD_STATE.klen_dev.copy_(
+                FIA_PAD_STATE.klen_host, non_blocking=True
+            )
         self.num_computed_tokens[:1].copy_(
             ib.num_computed_tokens_cpu_tensor[:1], non_blocking=True
         )
@@ -1222,6 +1261,38 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             num_scheduled_tokens_np=num_scheduled_tokens_np,
             cascade_attn_prefix_lens=cascade_attn_prefix_lens,
         )
+        if (
+            FIA_PAD_STATE.enabled
+            and FIA_PAD_STATE.capturing_pad
+            and for_cudagraph_capture
+            and num_tokens == 1
+        ):
+            # [minicpm-challenge: A-tier FIA pad] forge the bucket-1 FULL
+            # capture metadata: kv=512 descriptor (seq_lens_list),
+            # sparse_mode=0 (causal=False) + persistent wide mask, narrow
+            # block_table view. Only this fresh capture-time object is
+            # touched; the steady B4 cache is bypassed for captures and
+            # keeps stock fields for every eager fallback frame.
+            attn_metadata_cap, spec_common_cap = result
+            if spec_common_cap is None:
+                bucket = FIA_PAD_STATE.KV_PAD
+                for meta in attn_metadata_cap.values():
+                    if (
+                        getattr(meta, "attn_state", None)
+                        != AscendAttentionState.DecodeOnly
+                    ):
+                        continue
+                    meta.causal = False
+                    meta.attn_mask = FIA_PAD_STATE.mask_buf
+                    if meta.block_tables is not None:
+                        meta.block_tables = meta.block_tables[:, : bucket // 128]
+                    meta.seq_lens_list = [bucket]
+                FIA_PAD_STATE.pad_captured = True
+                FIA_PAD_STATE.baked_kv = bucket
+                logger.info(
+                    "[fia_pad] bucket-1 capture forged (kv=%d, sparse0 + wide mask)",
+                    bucket,
+                )
         if key is not None:
             attn_metadata, spec_common = result
             if spec_common is None:
@@ -1266,6 +1337,95 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 # Keep the device copy byte-identical for any eager fallback
                 # frame, without the per-frame pin_memory() allocation.
                 meta.query_start_loc.copy_(qsl_cpu, non_blocking=True)
+
+    def _update_full_graph_params_if_needed(
+        self,
+        forward_context,
+        num_tokens_padded: int,
+        positions: torch.Tensor | None,
+    ) -> None:
+        # [minicpm-challenge: A-tier FIA pad] replace the per-frame 20-layer
+        # FIA graph_task_update loop (~2.3ms host) with an ExternalEvent
+        # re-arm: the forged capture already bakes kv=bucket + sparse0 +
+        # wide mask + narrow block_table view, and the in-graph mask rebuild
+        # tracks klen, so steady frames need no re-issue at all. Promotion
+        # (klen crossed the bucket) and demotion (new short request while a
+        # high bucket is baked) run ONE forged stock update pass.
+        st = FIA_PAD_STATE
+        in_full = (
+            forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
+            and not forward_context.capturing
+            and not self.use_sparse
+            and not self.use_compress
+        )
+        if (
+            st.enabled
+            and not st.degraded
+            and in_full
+            and num_tokens_padded == 1
+            and st.pad_captured
+            and positions is not None
+        ):
+            events = get_graph_params().events.get(1)
+            klen = int(self.optimistic_seq_lens_cpu[0])
+            if events:
+                if klen > st.baked_kv:
+                    nb = next((b for b in st.BUCKETS if b >= klen), st.KV_MAX)
+                    try:
+                        self._fia_pad_forge_update(forward_context, nb, positions)
+                        st.baked_kv = nb
+                        logger.info("[fia_pad] promoted baked kv -> %d (klen=%d)", nb, klen)
+                        return
+                    except Exception:
+                        logger.exception("[fia_pad] promote forge failed; stock update")
+                elif st.baked_kv > st.KV_PAD and klen <= st.KV_PAD:
+                    try:
+                        self._fia_pad_forge_update(forward_context, st.KV_PAD, positions)
+                        st.baked_kv = st.KV_PAD
+                        logger.info("[fia_pad] demoted baked kv -> 512 (request switch)")
+                        return
+                    except Exception:
+                        logger.exception("[fia_pad] demote forge failed; stock update")
+                else:
+                    for ev in events:
+                        ev.record(self.update_stream)
+                    if not st.skip_logged:
+                        st.skip_logged = True
+                        logger.info("[fia_pad] steady skip engaged (baked_kv=%d)", st.baked_kv)
+                    return
+        super()._update_full_graph_params_if_needed(forward_context, num_tokens_padded, positions)
+        if st.enabled and not st.degraded and in_full and num_tokens_padded == 1:
+            # A stock pass re-baked kv from the live metadata (fall-through or
+            # failed forge); track it so the skip gate stays truthful until
+            # the next forge heals the descriptor.
+            st.baked_kv = int(self.optimistic_seq_lens_cpu[0])
+
+    def _fia_pad_forge_update(self, forward_context, new_bucket: int, positions) -> None:
+        # Temporarily swap the live per-layer metadata's kv descriptor and
+        # block_table to the forged bucket values, run ONE stock update pass
+        # (re-bakes the graph's kv + block_table descriptors), then restore
+        # the python attributes -- the enqueued update ops keep the forged
+        # device views (single request -> single bt row, so the narrow view
+        # shares the persistent buffer's base pointer).
+        attn_metadata = forward_context.attn_metadata
+        ncols = new_bucket // 128
+        saved = []
+        for meta in attn_metadata.values():
+            if (
+                getattr(meta, "attn_state", None)
+                != AscendAttentionState.DecodeOnly
+            ):
+                continue
+            saved.append((meta, meta.seq_lens_list, meta.block_tables))
+            meta.seq_lens_list = [new_bucket]
+            if meta.block_tables is not None:
+                meta.block_tables = meta.block_tables[:, :ncols]
+        try:
+            super()._update_full_graph_params_if_needed(forward_context, 1, positions)
+        finally:
+            for meta, seq_lens_saved, bt_saved in saved:
+                meta.seq_lens_list = seq_lens_saved
+                meta.block_tables = bt_saved
     #  -------------------------------------- Omni-new -------------------------------------------------
 
     def _sample(
