@@ -61,11 +61,51 @@ commit `1c2ad5f`。同参考音频的后续请求复用 prompt 特征与 CFM 初
 容量归零可恢复原生命周期)。官方 zh 评测集 2020 条含 1010 个 unique ref
 且同 ref 相邻,c1 负载下约半数请求命中:audio TTFP 191.8 → 166-170 ms。
 
+## 8. Stage runners 收尾包
+
+commit `0f21d91`。四处默认开的小优化合集:
+
+- stage 输入张量改二进制通道跨 stage 传递(msgspec bytes,免逐元素重建),f32 逐位不变;
+- bypass 请求跳过 stage0 lm_head(采样 token 被丢弃仍读 1.09 GB 权重);
+- stage1 解码帧 attention metadata 对象缓存(活 buffer 切片只重算标量);
+- 调度器/StreamContext 卫生项若干。
+
+效果(zh/32/c1):median RTF 0.1712 → **0.1658**(其中 metadata 缓存贡献 −0.0054),
+TTFP 166 → 159 ms;全量 2020 WER 1.23%,Daily 全量 77.94% 无回归。
+
+## 9. Stage1 talker FIA pad-to-bucket 图捕获
+
+commit `5a6e8c7`。新模块 `vllm_omni/platforms/npu/minicpmo_fia_pad.py` +
+runner 集成。Talker 解码走 ACL FULL 图,但 stock 捕获把 dummy kv 描述符与
+`sparse_mode=3` 烤进图,导致每帧回放前必须重发全部 20 层 FIA 图任务更新
+(host ~2.3 ms/帧,是解码节拍的最大单块)。本优化改烤捕获:
+
+- kv 描述符按桶(512)烤入而非 dummy;`sparse_mode=0` + 常驻宽 int8 mask;
+- mask 内容在**图内**每帧从常驻 klen 设备标量重建(`ge` + `copy_`,无分配,
+  回放读当前值),klen 由每帧 pinned→non_blocking H2D 发布;
+- 烤入 block_table 窄视图;KV 池一次性零填充(pad 内存经 mask 偏置仍可泄漏
+  NaN,零填充后逐位不可见);
+- 稳态帧只重摆 ExternalEvent(免整层重发);klen 越桶时用一次 stock 更新
+  提升到 {512,1024,2048,4096} 下一档,新短请求同样降档回 512。
+
+数值定律(微基准):klen ≤ 桶且 block_table 匹配时与 stock 路径 bitwise 相等;
+mask 偏置语义下 exp(-inf)=+0,pad 位贡献恒零。
+
+效果(zh/32/c1):median RTF 0.1658 → **0.1545-0.1558**;en 口径 0.1685-0.1708 →
+**0.1567-0.1570**;TTFP 159 → 156.6 ms。全量 2020 WER 复测 **1.21%**(≤1.56%,
+与关闭本项无差);Daily-Omni 30 题同题 A/B 对照 19/30=19/30 逐位同分,证明
+stage0(thinker)零接触(三 stage 独立进程,仅 stage1 引擎开本项)。
+
+逃生:`MINICPMO_FIA_PAD=0` 完全回 stock 捕获/更新;`=2` 仅烤捕获保留逐帧
+stock 更新(降级自检模式)。默认开。
+
 ## 质量验证矩阵
 
 | 验证 | 结果 |
 |------|------|
-| zh WER 全量 2020(bypass 路径) | 1.21% ≤ 1.56% |
+| zh WER 全量 2020(bypass 路径,HEAD 复测) | 1.21% ≤ 1.56% |
 | Daily-Omni 全量 1197(官方 file:// recipe) | 77.94% ≥ 77.5% |
+| Daily-Omni 30 题同题 A/B(FIA pad 开 vs 关) | 19/30 = 19/30 逐位同分 |
 | ASV en/zh(wavlm-base-plus) | 0.8678 / 0.8694 ≥ 0.689 |
 | plain chat 隔离(bypass 零命中) | engaged 计数零漂移 |
+| FIA pad 数值(微基准 vs stock 右下因果) | klen ≤ 桶 bitwise 相等 |
