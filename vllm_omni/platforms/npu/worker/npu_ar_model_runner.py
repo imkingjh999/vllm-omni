@@ -1409,17 +1409,37 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # shares the persistent buffer's base pointer).
         attn_metadata = forward_context.attn_metadata
         ncols = new_bucket // 128
-        saved = []
+        # Validate every layer group BEFORE mutating anything: layers in the
+        # same KV group share one metadata object (dedupe by id, or the
+        # restore would write the forged view back over the original and the
+        # block_table could never widen again), and a view too narrow for the
+        # target bucket must bail out before any device call -- torch slicing
+        # silently clamps it, the FIA update fails inside the graph task
+        # group, poisons it (107033 on every later update) and kills the
+        # engine.
+        metas = []
+        seen: set[int] = set()
         for meta in attn_metadata.values():
             if (
                 getattr(meta, "attn_state", None)
                 != AscendAttentionState.DecodeOnly
             ):
                 continue
-            saved.append((meta, meta.seq_lens_list, meta.block_tables))
-            meta.seq_lens_list = [new_bucket]
-            if meta.block_tables is not None:
-                meta.block_tables = meta.block_tables[:, :ncols]
+            if id(meta) in seen:
+                continue
+            seen.add(id(meta))
+            bt = meta.block_tables
+            if bt is not None and bt.shape[1] < ncols:
+                raise ValueError(
+                    f"block_table view too narrow for bucket {new_bucket} "
+                    f"({bt.shape[1]} < {ncols} cols)"
+                )
+            metas.append(meta)
+        saved = [(m, m.seq_lens_list, m.block_tables) for m in metas]
+        for m in metas:
+            m.seq_lens_list = [new_bucket]
+            if m.block_tables is not None:
+                m.block_tables = m.block_tables[:, :ncols]
         try:
             super()._update_full_graph_params_if_needed(forward_context, 1, positions)
         finally:
