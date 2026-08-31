@@ -99,13 +99,43 @@ stage0(thinker)零接触(三 stage 独立进程,仅 stage1 引擎开本项)。
 逃生:`MINICPMO_FIA_PAD=0` 完全回 stock 捕获/更新;`=2` 仅烤捕获保留逐帧
 stock 更新(降级自检模式)。默认开。
 
+## 10. Stage 核进程 CPU 绑核隔离
+
+commit `d9a1215c`。新模块 `vllm_omni/utils/cpu_isolation.py`:每个 stage-core
+进程启动时绑定到独立 8 核组(orchestrator 0-7 / stage1 8-15 / stage2 16-23 /
+stage3 24-31,affinity 与优先级同设),消除内核迁移与跨组争抢对逐帧 host
+派发循环的干扰。
+
+效果(en/32/c1 热态):median RTF 0.1566 → **0.1511-0.1530**(en 文本长、host
+侧最重,受益最大);zh 持平且地板 0.1550 → **0.1516**。全量 2020 zh WER 复测
+**1.20%**。跨 boot 方差 ±0.005 主导,以多 boot 地板口径计。
+
+逃生:`VLLM_OMNI_CPU_ISOLATE=1` 关闭(尊重 cgroup affinity 限制)。默认开。
+
+## 11. FIA pad 桶提升窄视图崩溃修复
+
+commit `dc32f42b`。§9 的桶提升路径 bug:forge 更新的恢复循环未对同 KV 组
+共享的 metadata 对象去重,恢复时后写胜出,把窄 block_table 视图永久留在
+live 元数据上;下一次桶提升切更宽视图被 torch 静默 clamp,FIA 拒绝
+act_seq_len > KV_S(error 561002),该失败图内调用毒化 rts task group,
+stock 回落更新随之 107033,整个引擎 EngineDead。触发条件 = 单请求 klen
+连跨两个桶(chat 语音回答单段 >~10s);bench、全量 WER 与 seed-tts 分段
+流量单段均不越桶,故此前从未暴露,仅在 demo 对话中触发。
+
+修复:forge 循环按对象 id 去重,并在任何变更/设备调用前前置校验全部
+block_table 宽度,过窄即 raise 给调用方,干净回落 stock 更新(不中毒)。
+验证:chat 单段 45.3s 回答 `promoted baked kv -> 2048 (klen=1025)` 干净
+通过、引擎存活;升降档循环无异常;zh/32/c1 median RTF 0.1544(带内零回归)。
+
 ## 质量验证矩阵
 
 | 验证 | 结果 |
 |------|------|
 | zh WER 全量 2020(bypass 路径,HEAD 复测) | 1.21% ≤ 1.56% |
+| zh WER 全量 2020(CPU 绑核面 `d9a1215c` 复测) | 1.20% ≤ 1.56% |
 | Daily-Omni 全量 1197(官方 file:// recipe) | 77.94% ≥ 77.5% |
 | Daily-Omni 30 题同题 A/B(FIA pad 开 vs 关) | 19/30 = 19/30 逐位同分 |
 | ASV en/zh(wavlm-base-plus) | 0.8678 / 0.8694 ≥ 0.689 |
 | plain chat 隔离(bypass 零命中) | engaged 计数零漂移 |
 | FIA pad 数值(微基准 vs stock 右下因果) | klen ≤ 桶 bitwise 相等 |
+| 桶提升长单段压力(chat 45.3s,klen 跨 1024) | 引擎存活,音频完整 |

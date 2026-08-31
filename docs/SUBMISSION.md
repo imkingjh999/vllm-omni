@@ -7,7 +7,7 @@
 - Fork 地址:https://github.com/imkingjh999/vllm-omni
 - 分支:minicpm-challenge
 - 提交面 commit 链(基于官方 minicpm-challenge,各项见 docs/OPTIMIZATION.md):
-  - `de9d347` plumb-fast → `cab8279` prep-fast → `d2630f6` TF-prefill bypass → `1c2ad5f` Code2Wav caches → `2b43522` submission docs → `0bc5323` assistant-prompt bypass fix → `751865b` docs 追补 → `0f21d91` stage runners 收尾包(默认开) → `5a6e8c7` stage1 FIA pad-to-bucket(默认开,代码面 HEAD)
+  - `de9d347` plumb-fast → `cab8279` prep-fast → `d2630f6` TF-prefill bypass → `1c2ad5f` Code2Wav caches → `2b43522` submission docs → `0bc5323` assistant-prompt bypass fix → `751865b` docs 追补 → `0f21d91` stage runners 收尾包(默认开) → `5a6e8c7` stage1 FIA pad-to-bucket(默认开) → `d9a1215c` stage 核 CPU 绑核隔离(默认开) → `dc32f42b` FIA pad 桶提升崩溃修复(代码面 HEAD)
 
 ## 提交定位
 基于官方 minicpm-challenge 分支的**推理性能优化**。全部优化以**代码默认值**形式生效:
@@ -42,9 +42,12 @@ zh 口径(HEAD `5a6e8c7` 两轮):
 
 en 口径(HEAD `5a6e8c7`):median RTF **0.1567**,TTFP 158.5 ms(对照关掉 5a6e8c7
 的 0.1685/0.1708,单此一项 −0.013)。
+CPU 绑核面(`d9a1215c`,热态):zh median RTF **0.1516 / 0.1544-0.1555**(跨 boot
+带),en **0.1511-0.1530**(较未绑核 en 地板 0.1566 下移;跨 boot 方差 ±0.005,
+按多 boot 地板口径)。
 链上各阶段 zh median RTF:0.2511(d2630f6 前)→ 0.1708(d2630f6)→ 0.1658(0f21d91)
-→ **0.1545-0.1558**(5a6e8c7)。
+→ **0.1545-0.1558**(5a6e8c7)→ **0.1516-0.1555**(d9a1215c)。
 
 ## Demo
-- 视频:TODO(待录制,B 站链接)
+- 视频:随包 `demo.mp4`(gradio 全双工语音对话实录,LAN 环境录制)
 - 启动方式:见 demo/README.md
